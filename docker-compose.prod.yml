@@ -1,0 +1,295 @@
+# docker-compose.prod.yml — Sistema Dono (Produção)
+# Uso: docker compose -f docker-compose.prod.yml up -d
+#
+# Este arquivo é otimizado para ambientes de produção, com:
+#   - Imagens buildadas com o alvo "runtime" (sem bind-mount de código).
+#   - Portas de DB/Redis/Ollama NÃO expostas ao host (acesso interno).
+#   - Health checks rigorosos para garantir disponibilidade.
+#   - Restrições de recursos (CPU/memória) para evitar sobrecarga.
+#   - Logs com driver json-file e rotação automática.
+#   - Rede isolada (dono-network).
+#   - Variáveis de ambiente lidas do arquivo .env (NÃO versionado).
+#
+# CORREÇÕES (2026-07-25):
+#   - Backend: comando agora verifica a existência do script de migrações
+#     antes de executá-lo, evitando erro "not found".
+#   - AI Worker: memória aumentada para 1G para evitar OOM Killer.
+#   - Todos os serviços com restart: unless-stopped.
+
+services:
+  # -------------------------------------------------------------------------
+  # Banco de dados PostgreSQL (com extensões pgcrypto e pgvector)
+  # -------------------------------------------------------------------------
+  db:
+    image: pgvector/pgvector:pg15
+    container_name: dono-db-prod
+    environment:
+      POSTGRES_DB: dono
+      POSTGRES_USER: dono
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?defina DB_PASSWORD no .env}
+    volumes:
+      # Scripts de inicialização (executados apenas na primeira criação do volume)
+      - ./scripts/00-create-databases.sql:/docker-entrypoint-initdb.d/00-create-databases.sql:ro
+      - ./scripts/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./scripts/business-queries.sql:/docker-entrypoint-initdb.d/02-business-queries.sql:ro
+      - ./scripts/seeds.sql:/docker-entrypoint-initdb.d/03-seeds.sql:ro
+      # Volume persistente para dados
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dono -d dono"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - dono-network
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # -------------------------------------------------------------------------
+  # Redis (rate limiting, cache, filas)
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: dono-redis-prod
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - dono-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.2'
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # -------------------------------------------------------------------------
+  # API Backend (FastAPI)
+  # -------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime   # imagem enxuta para produção
+    container_name: dono-api-prod
+    environment:
+      DATABASE_URL: postgresql://dono:${DB_PASSWORD}@db:5432/dono
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?defina JWT_SECRET no .env}
+      JWT_ISSUER: "Dono"
+      APP_ENV: production
+      # IA / RAG
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      # Logs estruturados (JSON) para facilitar coleta
+      LOG_JSON: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - dono-network
+    ports:
+      - "8000:8000"   # única porta exposta ao host
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '0.8'
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Comando corrigido: verifica se o script de migrações existe antes de executá-lo.
+    # O uso de "exec" substitui o shell pelo uvicorn, garantindo que sinais (SIGTERM)
+    # sejam corretamente capturados pelo processo principal.
+    command: >
+      sh -c "
+        if [ -f /run_migrations.sh ]; then
+          /run_migrations.sh;
+        fi;
+        exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+      "
+
+  # -------------------------------------------------------------------------
+  # Worker principal (processa eventos do outbox)
+  # -------------------------------------------------------------------------
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: dono-worker-prod
+    environment:
+      DATABASE_URL: postgresql://dono:${DB_PASSWORD}@db:5432/dono
+      REDIS_URL: redis://redis:6379
+      WORKER_FALLBACK_INTERVAL: ${WORKER_FALLBACK_INTERVAL:-300}
+      LOG_JSON: "true"
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - dono-network
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.3'
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # -------------------------------------------------------------------------
+  # Worker de Previsão de Consumo (Fase 4)
+  # -------------------------------------------------------------------------
+  forecast_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: dono-forecast-worker-prod
+    environment:
+      DATABASE_URL: postgresql://dono:${DB_PASSWORD}@db:5432/dono
+      REDIS_URL: redis://redis:6379
+      FORECAST_INTERVAL_HOURS: ${FORECAST_INTERVAL_HOURS:-24}
+      FORECAST_DAYS_AHEAD: ${FORECAST_DAYS_AHEAD:-30}
+      FORECAST_HISTORICAL_DAYS: ${FORECAST_HISTORICAL_DAYS:-90}
+      LOG_JSON: "true"
+    command: ["python", "-m", "app.forecast_worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - dono-network
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.2'
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # -------------------------------------------------------------------------
+  # Worker de IA (RAG, OCR, embeddings)
+  # CORREÇÃO: memória aumentada para 1G para evitar OOM Killer (exit code 137)
+  # O modelo de embedding e o processamento de OCR/LLM podem consumir muita RAM.
+  # -------------------------------------------------------------------------
+  ai_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: dono-ai-worker-prod
+    environment:
+      DATABASE_URL: postgresql://dono:${DB_PASSWORD}@db:5432/dono
+      REDIS_URL: redis://redis:6379
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      AI_WORKER_POLLING_INTERVAL: ${AI_WORKER_POLLING_INTERVAL:-5}
+      LOG_JSON: "true"
+    command: ["python", "-m", "app.ai_worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - dono-network
+    deploy:
+      resources:
+        limits:
+          memory: 2G      # <-- AUMENTADO para evitar OOM Killer
+          cpus: '0.8'
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # -------------------------------------------------------------------------
+  # Ollama (LLM local para IA)
+  # -------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: dono-ollama-prod
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_KEEP_ALIVE=5m
+    # Porta NÃO exposta ao host (acesso apenas via rede interna)
+    networks:
+      - dono-network
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "2"
+
+# -------------------------------------------------------------------------
+# Volumes persistentes
+# -------------------------------------------------------------------------
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_data:
+
+# -------------------------------------------------------------------------
+# Rede interna isolada
+# -------------------------------------------------------------------------
+networks:
+  dono-network:
+    external: true

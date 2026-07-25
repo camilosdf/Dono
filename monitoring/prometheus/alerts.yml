@@ -1,0 +1,34 @@
+# monitoring/prometheus/alerts.yml
+groups:
+  - name: dono_alerts
+    interval: 30s
+    rules:
+      # Alerta 1: Backend fora do ar
+      - alert: BackendDown
+        expr: up{job="dono-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "🚨 Backend API está fora do ar"
+          description: "O serviço backend não responde há mais de 1 minuto."
+
+      # Alerta 2: Alta taxa de erros 5xx
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⚠️ Alta taxa de erros (5xx)"
+          description: "A taxa de erros 5xx está acima de 5% nos últimos 2 minutos."
+
+      # Alerta 3: Muitas requisições em andamento (possível gargalo)
+      - alert: HighConcurrency
+        expr: http_requests_in_progress > 50
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⚡ Muitas requisições simultâneas"
+          description: "Mais de 50 requisições em andamento por mais de 2 minutos."

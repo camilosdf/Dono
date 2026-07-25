@@ -1,0 +1,14 @@
+# monitoring/alertmanager/config.yml
+route:
+  group_by: ['alertname', 'severity']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 12h
+  receiver: 'default'
+
+receivers:
+  - name: 'default'
+    # Por enquanto, apenas log. Futuramente, pode enviar e-mail, Slack, etc.
+    # slack_configs:
+    #   - api_url: 'https://hooks.slack.com/services/...'
+    #     channel: '#alerts'

@@ -1,0 +1,81 @@
+# =========================================================================
+# Sistema Dono — overrides SÓ para desenvolvimento local.
+#
+# O Docker Compose aplica este arquivo automaticamente por cima do
+# docker-compose.yml quando os dois estão na mesma pasta e você roda
+# `docker compose up` sem flags extras.
+#
+# Para simular produção localmente, rode com:
+#   docker compose -f docker-compose.yml up
+# =========================================================================
+#
+# ATUALIZAÇÃO (Frente A):
+#   - Adicionados overrides para forecast_worker e ai_worker:
+#       target: dev (hot-reload)
+#       volumes: ./backend:/app (código sincronizado ao vivo)
+#   - Exposta a porta do Ollama (11434) para testes locais
+#   - Expostas portas do PostgreSQL e Redis (já existentes)
+#   - Backend e worker já usam target: dev + volumes
+
+services:
+  db:
+    ports:
+      - "5432:5432"   # acesso de ferramentas externas (DBeaver, psql local etc.)
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  backend:
+    build:
+      target: dev
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app      # hot-reload
+      - ./scripts:/scripts  # scripts SQL para testes de integração
+    environment:
+      APP_ENV: development
+      # TEST_DATABASE_URL para pytest
+      TEST_DATABASE_URL: postgresql://dono:${DB_PASSWORD}@db:5432/dono_test
+
+  worker:
+    build:
+      target: dev
+    volumes:
+      - ./backend:/app
+
+  # =====================================================================
+  # OVERRIDE: forecast_worker (modo dev com hot-reload)
+  # =====================================================================
+  forecast_worker:
+    build:
+      target: dev
+    volumes:
+      - ./backend:/app
+    environment:
+      # Sobrescreve intervalo para testes mais rápidos (ex.: 1 hora)
+      FORECAST_INTERVAL_HOURS: ${FORECAST_INTERVAL_HOURS_DEV:-1}
+
+  # =====================================================================
+  # OVERRIDE: ai_worker (modo dev com hot-reload)
+  # =====================================================================
+  ai_worker:
+    build:
+      target: dev
+    volumes:
+      - ./backend:/app
+    environment:
+      # Em dev, pode usar modelos menores para testes rápidos
+      OLLAMA_MODEL: ${OLLAMA_MODEL_DEV:-llama3.2:3b}
+
+  # =====================================================================
+  # OVERRIDE: Ollama (expõe porta para testes e acesso externo)
+  # =====================================================================
+  ollama:
+    ports:
+      - "11434:11434"
+    # Em dev, podemos pré-carregar o modelo automaticamente
+    # usando um entrypoint customizado ou iniciar manualmente.
+    # Para iniciar manualmente:
+    #   docker compose exec ollama ollama pull llama3.2:3b

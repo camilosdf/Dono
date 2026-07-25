@@ -1,0 +1,197 @@
+# =========================================================================
+# Sistema Dono — docker-compose base
+#
+# Este arquivo é o padrão "seguro para produção": sem bind-mount de código
+# (a imagem carrega o código copiado no build, não montado do host) e sem
+# portas de DB/Redis expostas ao host. Para desenvolvimento local com
+# hot-reload, use por cima o docker-compose.override.yml (Docker Compose
+# aplica os dois automaticamente quando ambos existem na mesma pasta).
+#
+# ATUALIZAÇÃO (Frente A):
+#   - Adicionado serviço forecast_worker (previsão de consumo - Fase 4)
+#   - Adicionado serviço ai_worker (RAG/OCR/Assistente - Fase 7)
+#   - Adicionado serviço ollama (LLM local para IA)
+#   - Adicionado volume ollama_data para persistência dos modelos
+#   - Adicionadas variáveis de ambiente para configuração dos workers e IA
+# =========================================================================
+
+services:
+  # -------------------------------------------------------------------------
+  # Banco de dados PostgreSQL (com extensões pgcrypto e pgvector)
+  # -------------------------------------------------------------------------
+  db:
+    image: pgvector/pgvector:pg15
+    container_name: dono-db
+    environment:
+      POSTGRES_DB: dono
+      POSTGRES_USER: dono
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?defina DB_PASSWORD no .env}
+    volumes:
+      - ./scripts/00-create-databases.sql:/docker-entrypoint-initdb.d/00-create-databases.sql:ro
+      - ./scripts/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./scripts/business-queries.sql:/docker-entrypoint-initdb.d/02-business-queries.sql:ro
+      - ./scripts/seeds.sql:/docker-entrypoint-initdb.d/03-seeds.sql:ro
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dono -d dono"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dono-network
+
+  # -------------------------------------------------------------------------
+  # Redis (rate limiting, cache, filas temporárias)
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: dono-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dono-network
+
+  # -------------------------------------------------------------------------
+  # API Backend (FastAPI)
+  # -------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime                     # imagem enxuta para produção
+    container_name: dono-api
+    environment:
+      DATABASE_URL: postgresql://dono:${DB_PASSWORD}@db:5432/dono
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?defina JWT_SECRET no .env}
+      JWT_ISSUER: "Dono"
+      APP_ENV: ${APP_ENV:-production}
+      # IA / RAG (Fase 7) - variáveis para o worker de IA e possível uso no backend
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - dono-network
+
+  # -------------------------------------------------------------------------
+  # Worker principal (processa eventos do outbox)
+  # -------------------------------------------------------------------------
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: dono-worker
+    environment:
+      DATABASE_URL: postgresql://dono:${DB_PASSWORD}@db:5432/dono
+      REDIS_URL: redis://redis:6379
+      WORKER_FALLBACK_INTERVAL: ${WORKER_FALLBACK_INTERVAL:-300}
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - dono-network
+
+  # =====================================================================
+  # NOVO: Worker de Previsão de Consumo (Fase 4)
+  # =====================================================================
+  forecast_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: dono-forecast-worker
+    environment:
+      DATABASE_URL: postgresql://dono:${DB_PASSWORD}@db:5432/dono
+      REDIS_URL: redis://redis:6379
+      FORECAST_INTERVAL_HOURS: ${FORECAST_INTERVAL_HOURS:-24}
+      FORECAST_DAYS_AHEAD: ${FORECAST_DAYS_AHEAD:-30}
+      FORECAST_HISTORICAL_DAYS: ${FORECAST_HISTORICAL_DAYS:-90}
+    command: ["python", "-m", "app.forecast_worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - dono-network
+    restart: unless-stopped
+
+  # =====================================================================
+  # NOVO: Worker de IA / RAG / OCR (Fase 7)
+  # =====================================================================
+  ai_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: dono-ai-worker
+    environment:
+      DATABASE_URL: postgresql://dono:${DB_PASSWORD}@db:5432/dono
+      REDIS_URL: redis://redis:6379
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      AI_WORKER_POLLING_INTERVAL: ${AI_WORKER_POLLING_INTERVAL:-5}
+    command: ["python", "-m", "app.ai_worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - dono-network
+    restart: unless-stopped
+
+  # =====================================================================
+  # NOVO: Ollama (LLM Local para IA)
+  # =====================================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: dono-ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_KEEP_ALIVE=5m
+    # Porta NÃO exposta por padrão (segurança em produção).
+    # Em desenvolvimento, o .override.yml a expõe.
+    networks:
+      - dono-network
+    restart: unless-stopped
+    # Opcional: script para puxar o modelo ao iniciar
+    # command: ["ollama", "pull", "${OLLAMA_MODEL:-llama3.1:8b}"]
+    # Para pré-carregar, recomenda-se um entrypoint customizado ou
+    # primeiro start manual: docker compose exec ollama ollama pull <modelo>
+
+# -------------------------------------------------------------------------
+# Volumes persistentes
+# -------------------------------------------------------------------------
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_data:   # NOVO (persiste modelos baixados)
+
+# -------------------------------------------------------------------------
+# Rede interna isolada
+# -------------------------------------------------------------------------
+networks:
+  dono-network:
+    driver: bridge
