@@ -136,7 +136,9 @@ INSERT INTO regras_composicao (genero_refeicao, genero_prato_obrigatorio) VALUES
 ('Coffee Break', 'Frutas'),
 
 -- Colação
-('Colação', 'Frios/Laticínios')
+('Colação', 'Frios/Laticínios'),
+('Colação', 'Padaria'),
+('Colação', 'Bebida Quente')
 
 ON CONFLICT (genero_refeicao, genero_prato_obrigatorio) DO NOTHING;
 

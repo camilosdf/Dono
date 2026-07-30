@@ -42,10 +42,15 @@ def get_ocr():
     """
     global _ocr
     if _ocr is None:
-        logger.info("Inicializando PaddleOCR (pode levar alguns segundos)...")
-        # show_log=False para não poluir os logs
-        _ocr = paddleocr.PaddleOCR(use_angle_cls=True, lang='pt', show_log=False)
-        logger.info("PaddleOCR inicializado")
+        try:
+            logger.info("Inicializando PaddleOCR (pode levar alguns segundos)...")
+            _ocr = paddleocr.PaddleOCR(use_angle_cls=True, lang='pt', show_log=False)
+            logger.info("PaddleOCR inicializado")
+        except Exception as e:
+            logger.warning(
+                "PaddleOCR nao disponivel (%s) -- OCR degradado para Tesseract apenas.", e
+            )
+            return None
     return _ocr
 
 
@@ -76,8 +81,13 @@ async def extrair_texto_imagem(imagem_bytes: bytes) -> str:
         logger.warning("Tesseract falhou: %s, tentando PaddleOCR", e)
 
     # 2. Fallback com PaddleOCR (mais preciso para notas fiscais)
+    ocr = get_ocr()
+    if ocr is None:
+        raise ValueError(
+            "Tesseract nao extraiu texto e PaddleOCR nao esta disponivel. "
+            "Verifique os logs de inicializacao do OCR."
+        )
     try:
-        ocr = get_ocr()
         # PaddleOCR espera o caminho do arquivo ou imagem em array
         resultado = ocr.ocr(imagem_bytes, cls=True)
         if resultado and len(resultado) > 0:

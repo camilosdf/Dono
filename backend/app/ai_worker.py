@@ -70,6 +70,11 @@ async def processar_proximo_job(db_pool: asyncpg.Pool) -> bool:
         usuario_id = job["solicitado_por"]
 
         try:
+            # Injeta contexto de auditoria com o usuário que solicitou o job
+            await conn.execute(
+                "SELECT fn_set_audit_context($1::uuid, $2, $3)",
+                usuario_id, "worker://dono-ai-worker", "dono-ai-worker"
+            )
             # Marca como processando
             await conn.execute(
                 "UPDATE ia_jobs SET status = 'processando' WHERE id = $1",

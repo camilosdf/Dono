@@ -1,3 +1,4 @@
+import asyncpg
 # backend/app/routes/insumos.py — Sistema Dono
 #
 # Rotas para gestão de insumos, lotes e cotações:
@@ -163,7 +164,7 @@ async def remover_insumo(insumo_id: str, _: dict = Depends(require_perfil("ADMIN
     async with pool.acquire() as conn:
         try:
             await conn.execute("UPDATE insumos SET ativo = FALSE WHERE id = $1", uuid.UUID(insumo_id))
-        except Exception:
+        except asyncpg.ForeignKeyViolationError:
             raise HTTPException(status_code=409, detail=error_detail("INSUMO_EM_USO", "Insumo em uso por alguma receita"))
 
 

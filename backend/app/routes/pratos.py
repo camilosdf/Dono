@@ -1,3 +1,4 @@
+import asyncpg
 # backend/app/routes/pratos.py — Sistema Dono
 import uuid
 from decimal import Decimal
@@ -251,7 +252,7 @@ async def remover_prato(prato_id: str, _: dict = Depends(require_perfil("ADMIN")
     async with pool.acquire() as conn:
         try:
             await conn.execute("UPDATE pratos SET status = 'INATIVO' WHERE id = $1", uuid.UUID(prato_id))
-        except Exception:
+        except asyncpg.ForeignKeyViolationError:
             raise HTTPException(status_code=409, detail=error_detail("PRATO_EM_USO", "Prato em uso em alguma refeição"))
 
 

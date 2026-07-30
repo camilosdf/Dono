@@ -37,6 +37,7 @@ import asyncio
 import asyncpg
 import logging
 from datetime import datetime, timedelta
+from app.redis_client import get_redis
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +61,12 @@ async def run_forecast(db_pool: asyncpg.Pool, days_ahead: int, historical_days: 
                 days_ahead, historical_days
             )
             start = datetime.now()
+
+            # Define contexto de auditoria do worker de previsão
+            await conn.execute(
+                "SELECT fn_set_audit_context($1::uuid, $2, $3)",
+                None, "worker://dono-forecast-worker", "dono-forecast-worker"
+            )
 
             # Chama a função SQL que recalcula e insere as previsões
             await conn.execute(
@@ -99,11 +106,21 @@ async def main() -> None:
     try:
         while True:
             try:
-                # Executa a atualização
-                await run_forecast(db_pool, days_ahead, historical_days)
-
-                # Aguarda o próximo intervalo
-                logger.info("Aguardando %s horas até a próxima execução", interval_hours)
+                # Lock Redis: garante que apenas uma réplica executa por vez.
+                # TTL = intervalo + 10min de margem para execucoes longas.
+                redis = get_redis()
+                lock_key = "dono:forecast_worker:lock"
+                lock_ttl = interval_hours * 3600 + 600
+                acquired = await redis.set(lock_key, "1", nx=True, ex=lock_ttl)
+                if not acquired:
+                    logger.info("Outra replica ja esta executando o forecast -- aguardando.")
+                    await asyncio.sleep(interval_hours * 3600)
+                    continue
+                try:
+                    await run_forecast(db_pool, days_ahead, historical_days)
+                finally:
+                    await redis.delete(lock_key)
+                logger.info("Aguardando %s horas ate a proxima execucao", interval_hours)
                 await asyncio.sleep(interval_hours * 3600)
 
             except (KeyboardInterrupt, asyncio.CancelledError):

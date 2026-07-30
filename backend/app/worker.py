@@ -41,6 +41,12 @@ async def process_events(db_pool: asyncpg.Pool) -> None:
     """
     async with db_pool.acquire() as conn:
         try:
+            # Define contexto de auditoria do worker (processo de sistema,
+            # sem usuario_id real — distinguível no event_store por ip_origem)
+            await conn.execute(
+                "SELECT fn_set_audit_context($1::uuid, $2, $3)",
+                None, "worker://dono-worker", "dono-worker/outbox"
+            )
             # 1. Processa eventos pendentes com a lógica de retry/lock no banco
             await conn.execute("SELECT fn_processar_eventos_pendentes();")
             

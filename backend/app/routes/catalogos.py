@@ -1,3 +1,4 @@
+import asyncpg
 # backend/app/routes/catalogos.py — Sistema Dono
 import uuid
 
@@ -67,7 +68,7 @@ async def criar_categoria(body: CriarCategoriaRequest, _: dict = Depends(require
                 "INSERT INTO categorias (nome, genero_id) VALUES ($1, $2) RETURNING id, nome",
                 body.nome, genero_id,
             )
-        except Exception:
+        except asyncpg.UniqueViolationError:
             raise HTTPException(status_code=409, detail=error_detail("CATEGORIA_JA_EXISTE", "Categoria já cadastrada para este gênero"))
         return CategoriaOut(id=str(row["id"]), nome=row["nome"], genero=body.genero)
 
