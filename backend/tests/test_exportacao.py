@@ -102,8 +102,8 @@ class TestExportacaoRelatorios:
                              headers=auth_headers(token_admin))
         assert r.status_code == 200
         wb = load_workbook(io.BytesIO(r.content))
-        assert "Lotes Vencendo" in wb.sheetnames
-        assert "Insumos Zerados" in wb.sheetnames
+        assert "Lotes Vencendo em 7 dias" in wb.sheetnames
+        assert "Insumos com Estoque Zerado" in wb.sheetnames
 
     async def test_abc_nao_calculado_retorna_404(self, client, token_admin):
         fake_id = "00000000-0000-0000-0000-000000000000"
