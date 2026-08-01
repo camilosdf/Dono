@@ -1,3 +1,4 @@
+import json
 # backend/app/ai_worker.py — Sistema Dono
 #
 # Worker dedicado para processar jobs de IA (OCR, RAG, embeddings).
@@ -105,6 +106,7 @@ async def processar_proximo_job(db_pool: asyncpg.Pool) -> bool:
                 raise ValueError(f"Tipo de job não suportado: {tipo}")
 
             # Atualiza job como concluído
+            # asyncpg exige JSONB como string serializada, não dict Python
             await conn.execute(
                 """UPDATE ia_jobs
                    SET status = 'concluido',
@@ -112,7 +114,7 @@ async def processar_proximo_job(db_pool: asyncpg.Pool) -> bool:
                        concluido_em = now()
                    WHERE id = $1""",
                 job_id,
-                resultado
+                json.dumps(resultado)
             )
             logger.info("Job %s concluído com sucesso", job_id)
 
