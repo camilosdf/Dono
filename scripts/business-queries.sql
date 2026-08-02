@@ -749,17 +749,11 @@ $$ LANGUAGE plpgsql;
 
 -- ---------------------------------------------------------------------
 -- fn_calcular_previsao_consumo
--- Calcula a previsão de consumo para um insumo específico para os
--- próximos N dias, com base na média móvel ponderada por dia da semana
--- e ajuste por menus futuros (MRP).
---
--- Parâmetros:
---   p_insumo_id   UUID   - ID do insumo
---   p_dias        INT    - número de dias futuros para prever (padrão 30)
---   p_historico   INT    - dias de histórico a considerar (padrão 90)
---
--- Retorno: tabela com data_referencia, quantidade_prevista, metodo
--- ---------------------------------------------------------------------
+-- Calcula previsão de consumo combinando:
+--   1. MRP por evento (necessidade alocada na data do menu, calculada 1x para todo o horizonte)
+--   2. Média histórica de BAIXA_EXECUCAO por dia da semana (calibração)
+-- Isso substitui a abordagem anterior que chamava fn_mrp_previsao_compras N×M vezes
+-- (uma por dia por insumo) e diluía a necessidade do evento por p_dias.
 CREATE OR REPLACE FUNCTION fn_calcular_previsao_consumo(
     p_insumo_id UUID,
     p_dias INTEGER DEFAULT 30,
@@ -771,32 +765,72 @@ RETURNS TABLE (
     metodo VARCHAR(30)
 ) AS $$
 DECLARE
-    v_consumo_medio NUMERIC(12,3);
-    v_ajuste_mrp NUMERIC(12,3);
     v_data DATE;
     v_semana_dia INTEGER;
     v_consumo_dia_semana NUMERIC(12,3);
-    v_consumo_total_historico NUMERIC(12,3);
-    v_dias_historico INTEGER;
+    v_necessidade_evento NUMERIC(12,3);
+    v_metodo VARCHAR(30);
 BEGIN
-    FOR i IN 0..p_dias-1 LOOP
-        v_data := CURRENT_DATE + i;
+    -- ----------------------------------------------------------------
+    -- 1. MRP calculado UMA ÚNICA VEZ para todo o horizonte.
+    --    Resultado em tabela temporária: necessidade bruta por data de
+    --    início do menu (não diluída por dia — cada evento tem seu pico
+    --    na data em que ocorre, não espalhado pelo horizonte inteiro).
+    -- ----------------------------------------------------------------
+    CREATE TEMP TABLE IF NOT EXISTS _mrp_horizonte (
+        insumo_id UUID,
+        data_evento DATE,
+        necessidade NUMERIC(12,3)
+    ) ON COMMIT DROP;
+
+    TRUNCATE _mrp_horizonte;
+
+    INSERT INTO _mrp_horizonte (insumo_id, data_evento, necessidade)
+    SELECT
+        ir.insumo_id,
+        m.data_inicio AS data_evento,
+        SUM(ir.peso_liquido * (r.qtd_pessoas::numeric / NULLIF(p.rendimento_base_porcoes, 0)))
+            AS necessidade
+    FROM itens_menu im
+    JOIN menus m         ON m.id = im.menu_id
+    JOIN refeicoes r     ON r.id = im.refeicao_id
+    JOIN itens_refeicao irf ON irf.refeicao_id = r.id
+    JOIN pratos p        ON p.id = irf.prato_id
+    JOIN itens_receita ir ON ir.prato_id = p.id
+    WHERE m.status IN ('PLANEJADO', 'CONFIRMADO')
+      AND m.data_inicio BETWEEN CURRENT_DATE AND CURRENT_DATE + p_dias
+      AND ir.insumo_id = p_insumo_id
+    GROUP BY ir.insumo_id, m.data_inicio;
+
+    -- ----------------------------------------------------------------
+    -- 2. Para cada dia do horizonte, combina:
+    --    a) Base histórica: média de consumo real (BAIXA_EXECUCAO)
+    --       pelo mesmo dia da semana nos últimos p_historico dias.
+    --       Fallback: média geral do período se não houver dado por
+    --       dia da semana.
+    --    b) Necessidade de evento: soma das necessidades MRP alocadas
+    --       exatamente nesta data (não diluída).
+    --    Método reportado reflete qual fonte dominou.
+    -- ----------------------------------------------------------------
+    FOR v_data IN
+        SELECT generate_series(CURRENT_DATE, CURRENT_DATE + p_dias - 1, '1 day'::interval)::date
+    LOOP
         v_semana_dia := EXTRACT(DOW FROM v_data);
 
+        -- Base histórica por dia da semana
         SELECT COALESCE(AVG(quantidade), 0)
           INTO v_consumo_dia_semana
           FROM (
-              SELECT
-                  DATE_TRUNC('day', criado_em) AS dia,
-                  SUM(quantidade) AS quantidade
+              SELECT SUM(quantidade) AS quantidade
                 FROM movimentacoes_estoque
                WHERE insumo_id = p_insumo_id
                  AND tipo = 'BAIXA_EXECUCAO'
                  AND criado_em >= CURRENT_DATE - (p_historico || ' days')::INTERVAL
                GROUP BY DATE_TRUNC('day', criado_em)
-          ) consumo_por_dia
-          WHERE EXTRACT(DOW FROM dia) = v_semana_dia;
+               HAVING EXTRACT(DOW FROM DATE_TRUNC('day', criado_em)) = v_semana_dia
+          ) consumo_dia_semana;
 
+        -- Fallback: média geral se não há histórico para este dia da semana
         IF v_consumo_dia_semana = 0 THEN
             SELECT COALESCE(AVG(quantidade), 0)
               INTO v_consumo_dia_semana
@@ -810,23 +844,27 @@ BEGIN
               ) consumo_total;
         END IF;
 
-        -- Ajuste por menus futuros (MRP)
-        SELECT COALESCE(SUM(necessidade_bruta), 0) INTO v_ajuste_mrp
-          FROM fn_mrp_previsao_compras(v_data)
-         WHERE insumo_id = p_insumo_id;
+        -- Necessidade de evento alocada nesta data (do MRP pré-calculado)
+        SELECT COALESCE(SUM(necessidade), 0)
+          INTO v_necessidade_evento
+          FROM _mrp_horizonte
+         WHERE data_evento = v_data;
 
-        IF v_ajuste_mrp > 0 THEN
-            v_ajuste_mrp := v_ajuste_mrp / p_dias;
+        -- Determina método predominante
+        IF v_necessidade_evento > 0 AND v_consumo_dia_semana > 0 THEN
+            v_metodo := 'HIBRIDO_EVENTO_HISTORICO';
+        ELSIF v_necessidade_evento > 0 THEN
+            v_metodo := 'MRP_EVENTO';
+        ELSE
+            v_metodo := 'MEDIA_HISTORICA';
         END IF;
 
-        quantidade_prevista := ROUND(COALESCE(v_consumo_dia_semana, 0) + COALESCE(v_ajuste_mrp, 0), 3);
-
-        IF quantidade_prevista < 0 THEN
-            quantidade_prevista := 0;
-        END IF;
-
-        data_referencia := v_data;
-        metodo := 'MEDIA_MOVEL_PONDERADA';
+        data_referencia     := v_data;
+        quantidade_prevista := ROUND(
+            COALESCE(v_consumo_dia_semana, 0) + COALESCE(v_necessidade_evento, 0),
+            3
+        );
+        metodo := v_metodo;
 
         RETURN NEXT;
     END LOOP;
