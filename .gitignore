@@ -4,3 +4,8 @@
 __pycache__/
 *.pyc
 *.bak
+
+# Variáveis de ambiente (nunca versionar)
+.env
+.env.local
+.env.*.local

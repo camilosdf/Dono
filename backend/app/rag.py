@@ -168,7 +168,9 @@ Pergunta: {pergunta}
 
 Resposta:"""
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    import os
+    _timeout = float(os.getenv("OLLAMA_TIMEOUT", "120.0"))
+    async with httpx.AsyncClient(timeout=_timeout) as client:
         response = await client.post(
             f"{OLLAMA_HOST}/api/generate",
             json={

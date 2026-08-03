@@ -103,6 +103,9 @@ services:
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-300}
+      RAG_MAX_DOC_CHARS: ${RAG_MAX_DOC_CHARS:-2500}
+      RAG_MAX_CONTEXT_CHARS: ${RAG_MAX_CONTEXT_CHARS:-8000}
       # Logs estruturados (JSON) para facilitar coleta
       LOG_JSON: "true"
     depends_on:

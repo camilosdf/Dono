@@ -37,7 +37,7 @@ import asyncio
 import asyncpg
 import logging
 from datetime import datetime, timedelta
-from app.redis_client import get_redis
+from app.redis_client import connect as redis_connect, disconnect as redis_disconnect, get_redis
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,6 +102,7 @@ async def main() -> None:
 
     # Cria pool de conexões
     db_pool = await asyncpg.create_pool(database_url, min_size=1, max_size=5)
+    await redis_connect()
 
     try:
         while True:
@@ -133,6 +134,7 @@ async def main() -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Worker de Previsão interrompido.")
     finally:
+        await redis_disconnect()
         await db_pool.close()
 
 

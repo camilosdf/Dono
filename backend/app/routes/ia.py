@@ -107,10 +107,30 @@ async def consultar_rag(
         )
 
     # 4. Monta o contexto a partir dos documentos recuperados
-    contexto = "\n\n---\n".join([
-        f"Documento: {doc['titulo'] or 'Sem título'}\n{doc['conteudo']}"
-        for doc in documentos
-    ])
+    # Limite por documento e por contexto total para evitar timeout no LLM
+    # em CPU (modelos locais como llama3.2:3b têm janela de contexto limitada
+    # e ficam lentos com prompts grandes). Valores configuráveis via .env.
+    import os
+    MAX_DOC_CHARS = int(os.getenv("RAG_MAX_DOC_CHARS", "2500"))
+    MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "8000"))
+
+    contexto = ""
+    fontes_usadas = []
+    for doc in documentos:
+        trecho = f"Documento: {doc['titulo'] or 'Sem título'}\n{doc['conteudo'][:MAX_DOC_CHARS]}"
+        bloco = trecho + "\n\n---\n"
+        if len(contexto) + len(bloco) > MAX_CONTEXT_CHARS:
+            break
+        contexto += bloco
+        fontes_usadas.append(doc)
+
+    logger.info(
+        "RAG: %d docs recuperados, %d usados no contexto, %d caracteres",
+        len(documentos), len(fontes_usadas), len(contexto)
+    )
+
+    # Substitui documentos pela lista filtrada para as fontes da resposta
+    documentos = fontes_usadas
 
     # 5. Consulta o LLM local (Ollama) com o contexto
     try:

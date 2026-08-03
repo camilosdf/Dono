@@ -34,6 +34,7 @@ services:
     volumes:
       - ./backend:/app      # hot-reload
       - ./scripts:/scripts  # scripts SQL para testes de integração
+      - ./docs:/app/docs:ro  # glossário e ADRs para popular_rag.py
     environment:
       APP_ENV: development
       # TEST_DATABASE_URL para pytest
@@ -65,6 +66,7 @@ services:
       target: dev
     volumes:
       - ./backend:/app
+      - ./docs:/app/docs:ro  # glossário e ADRs para RAG
     environment:
       # Em dev, pode usar modelos menores para testes rápidos
       OLLAMA_MODEL: ${OLLAMA_MODEL_DEV:-llama3.2:3b}

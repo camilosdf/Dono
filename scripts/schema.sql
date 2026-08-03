@@ -354,7 +354,17 @@ CREATE TABLE documentos (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     titulo          VARCHAR(200),
     conteudo        TEXT NOT NULL,
-    tipo            VARCHAR(30) CHECK (tipo IN ('FICHA_TECNICA', 'POP', 'LEGISLACAO', 'NOTA_FISCAL', 'OUTRO')),
+    tipo            VARCHAR(30) CHECK (tipo IN (
+        'FICHA_TECNICA',
+        'POP',
+        'LEGISLACAO',
+        'NOTA_FISCAL',
+        'OUTRO',
+        'REGRAS_COMPOSICAO',
+        'ESTILO_SERVICO',
+        'GLOSSARIO',
+        'ADR'
+    )),
     entidade_id     UUID,
     metadados       JSONB,
     embedding       vector(384),        -- dimensão fixa para o modelo all-MiniLM-L6-v2
