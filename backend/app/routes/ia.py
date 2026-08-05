@@ -1,16 +1,15 @@
 # backend/app/routes/ia.py — Sistema Dono
 #
-# Rotas para IA: prospecção, cotação online, RAG e OCR.
+# Rotas de Inteligência Artificial:
+#   - RAG: consulta com recuperação de documentos (pgvector + Ollama)
+#   - OCR: processamento de notas fiscais (PDF/imagem) via ai_worker
+#   - NF-e XML: parser direto de XML de Nota Fiscal Eletrônica (síncrono)
+#   - Prospecção de pratos: match direto + sugestão criativa (stub LLM)
+#   - Cotação online: busca de preços via agente externo (stub)
 #
-# ATUALIZAÇÃO (Fase 7):
-#   - Adicionados endpoints para RAG (consulta) e OCR (processamento de notas).
-#   - Suporte a upload de arquivos para notas fiscais (multipart/form-data).
-#   - Novos tipos de job: 'OCR_NOTA' e 'RAG_CONSULTA' (adicionados no schema).
-#   - Correção: importação do logger e tratamento específico para ValueError.
-#
-# Módulos auxiliares:
-#   - app.rag: funções para buscar documentos, consultar LLM, enfileirar jobs.
-#   - app.ocr: (chamado indiretamente via rag.processar_job_ocr)
+# Atualização H1: integração NF-e XML (parsear_xml_nfe / salvar_nfe_xml)
+#   adicionada como rotas síncronas — sem job_id, sem polling, porque
+#   parsing de XML é instantâneo (diferente de OCR que exige inferência).
 
 import uuid
 import logging
@@ -23,25 +22,24 @@ from pydantic import BaseModel
 from app.database import get_pool
 from app.dependencies import require_perfil
 from app.errors import error_detail
+from app.nfe_xml import parsear_xml_nfe, salvar_nfe_xml
 from app.rag import (
     buscar_documentos_similares,
     consultar_llm,
-    enfileirar_job_ocr
+    enfileirar_job_ocr,
 )
 from app.rate_limit import acquire_ia_slot, check_ia_rate_limit, release_ia_slot
 
-# Configura o logger
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ia")
 
 
 # =====================================================================
-# Modelos para RAG
+# Modelos
 # =====================================================================
 
 class ConsultaRAGRequest(BaseModel):
-    """Payload para consulta RAG."""
     pergunta: str
     top_k: int = 5
     tipo_documento: Optional[str] = None
@@ -49,67 +47,102 @@ class ConsultaRAGRequest(BaseModel):
 
 
 class ConsultaRAGResponse(BaseModel):
-    """Resposta da consulta RAG."""
     resposta: str
-    fontes: list[dict]  # id, titulo, similaridade
+    fontes: list[dict]
+
+
+class ProspeccaoRequest(BaseModel):
+    criterio: str = "INSUMOS_CRITICOS"   # ou "MANUAL"
+    insumo_ids: list[str] | None = None
+    estilo_menu: str | None = None
+    dias_vencimento: int = 7
+
+
+class JobOut(BaseModel):
+    job_id: str
+    status: str
+    resultado: dict | list | None = None
+    erro_motivo: str | None = None
+
+
+class CotacaoOnlineRequest(BaseModel):
+    insumo_ids: list[str]
+    fornecedores_alvo: list[str] | None = None
 
 
 # =====================================================================
-# RAG - Consulta com recuperação de documentos
+# Helpers internos
+# =====================================================================
+
+async def _insumos_criticos(conn, dias: int) -> list[dict]:
+    rows = await conn.fetch(
+        """SELECT DISTINCT i.id AS insumo_id, i.nome
+             FROM insumos i JOIN lotes_insumo l ON l.insumo_id = i.id
+            WHERE l.quantidade_disponivel > 0
+              AND l.data_validade IS NOT NULL
+              AND l.data_validade <= CURRENT_DATE + $1::int
+            ORDER BY i.nome""",
+        dias,
+    )
+    return [dict(r) for r in rows]
+
+
+async def _sugerir_pratos_criativos(
+    insumos_criticos: list[dict], estilo_menu: str | None
+) -> list[dict]:
+    """Ponto de extensão para LLM. Sem provedor configurado, falha explicitamente."""
+    raise NotImplementedError(
+        "Nenhum provedor de LLM configurado neste ambiente para sugestão criativa"
+    )
+
+
+async def _buscar_precos_externos(
+    insumo_ids: list[str], fornecedores_alvo: list[str] | None
+) -> dict:
+    """Ponto de extensão para adapter de scraping/API de fornecedores."""
+    raise NotImplementedError(
+        "Nenhum adapter de cotação online configurado neste ambiente"
+    )
+
+
+# =====================================================================
+# RAG — Consulta com recuperação de documentos
 # =====================================================================
 
 @router.post("/consultar", response_model=ConsultaRAGResponse)
 async def consultar_rag(
     body: ConsultaRAGRequest,
-    current_user: dict = Depends(require_perfil("CHEF", "GESTAO", "ADMIN"))
+    current_user: dict = Depends(require_perfil("CHEF", "GESTAO", "ADMIN")),
 ):
-    """Consulta o assistente RAG (Retrieval-Augmented Generation).
-    
-    Busca documentos similares (fichas técnicas, POPs, legislação) e gera
-    uma resposta com base no contexto recuperado, usando um LLM local (Ollama).
+    """Consulta o assistente RAG (pgvector + Ollama).
 
-    Args:
-        body.pergunta: Pergunta em linguagem natural.
-        body.top_k: Número de documentos a recuperar (padrão 5).
-        body.tipo_documento: Filtrar por tipo (FICHA_TECNICA, POP, etc.)
-        body.entidade_id: Filtrar por entidade (prato_id, insumo_id, etc.)
-
-    Returns:
-        Resposta gerada e lista de fontes (documentos usados como contexto).
+    Busca documentos similares e gera resposta com base no contexto
+    recuperado. Rate limit: 10 req/hora por usuário.
     """
-    # Aplica rate limit específico para IA (10 req/hora)
     await check_ia_rate_limit(current_user["user_id"])
-    # Não usamos slot global para RAG pois é síncrono e relativamente leve
 
-    # 1. Converte entidade_id para UUID (se fornecido)
     entidade_uuid = uuid.UUID(body.entidade_id) if body.entidade_id else None
 
-    # 2. Busca documentos similares (via pgvector)
     try:
         documentos = await buscar_documentos_similares(
             pergunta=body.pergunta,
             top_k=body.top_k,
             tipo=body.tipo_documento,
-            entidade_id=entidade_uuid
+            entidade_id=entidade_uuid,
         )
     except Exception as e:
         logger.exception("Erro ao buscar documentos similares")
         raise HTTPException(
             status_code=500,
-            detail=error_detail("ERRO_INTERNO", f"Erro na busca de documentos: {str(e)}")
+            detail=error_detail("ERRO_INTERNO", f"Erro na busca de documentos: {e}"),
         )
 
-    # 3. Se não encontrou documentos, retorna resposta informativa
     if not documentos:
         return ConsultaRAGResponse(
-            resposta="Não encontrei informações relevantes nos documentos disponíveis para responder sua pergunta.",
-            fontes=[]
+            resposta="Não encontrei informações relevantes nos documentos disponíveis.",
+            fontes=[],
         )
 
-    # 4. Monta o contexto a partir dos documentos recuperados
-    # Limite por documento e por contexto total para evitar timeout no LLM
-    # em CPU (modelos locais como llama3.2:3b têm janela de contexto limitada
-    # e ficam lentos com prompts grandes). Valores configuráveis via .env.
     import os
     MAX_DOC_CHARS = int(os.getenv("RAG_MAX_DOC_CHARS", "2500"))
     MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "8000"))
@@ -117,8 +150,7 @@ async def consultar_rag(
     contexto = ""
     fontes_usadas = []
     for doc in documentos:
-        trecho = f"Documento: {doc['titulo'] or 'Sem título'}\n{doc['conteudo'][:MAX_DOC_CHARS]}"
-        bloco = trecho + "\n\n---\n"
+        bloco = f"Documento: {doc['titulo'] or 'Sem título'}\n{doc['conteudo'][:MAX_DOC_CHARS]}\n\n---\n"
         if len(contexto) + len(bloco) > MAX_CONTEXT_CHARS:
             break
         contexto += bloco
@@ -126,13 +158,9 @@ async def consultar_rag(
 
     logger.info(
         "RAG: %d docs recuperados, %d usados no contexto, %d caracteres",
-        len(documentos), len(fontes_usadas), len(contexto)
+        len(documentos), len(fontes_usadas), len(contexto),
     )
 
-    # Substitui documentos pela lista filtrada para as fontes da resposta
-    documentos = fontes_usadas
-
-    # 5. Consulta o LLM local (Ollama) com o contexto
     try:
         resposta = await consultar_llm(body.pergunta, contexto)
     except Exception as e:
@@ -141,99 +169,85 @@ async def consultar_rag(
             status_code=503,
             detail=error_detail(
                 "SERVICO_INDISPONIVEL",
-                f"Erro ao consultar o LLM: {str(e)}. Verifique se o Ollama está rodando."
-            )
+                f"Erro ao consultar o LLM: {e}. Verifique se o Ollama está rodando.",
+            ),
         )
 
-    # 6. Retorna a resposta com as fontes utilizadas
     return ConsultaRAGResponse(
         resposta=resposta,
         fontes=[
             {
                 "id": doc["id"],
                 "titulo": doc["titulo"] or "Documento sem título",
-                "similaridade": round(doc["similaridade"], 4)
+                "similaridade": round(doc["similaridade"], 4),
             }
-            for doc in documentos
-        ]
+            for doc in fontes_usadas
+        ],
     )
 
 
 # =====================================================================
-# OCR - Processamento de Notas Fiscais
+# OCR — Processamento de Notas Fiscais (PDF/imagem)
 # =====================================================================
 
 @router.post("/processar-nota", status_code=202)
 async def processar_nota_fiscal(
     arquivo: UploadFile = File(...),
-    current_user: dict = Depends(require_perfil("COMPRAS", "ADMIN"))
+    current_user: dict = Depends(require_perfil("COMPRAS", "ADMIN")),
 ):
-    """Envia uma nota fiscal (PDF ou imagem) para extração automática de dados.
-    
-    O processamento é assíncrono: retorna um job_id para consulta de status.
-    O arquivo é armazenado temporariamente no Redis com TTL de 1 hora.
+    """Envia nota fiscal (PDF ou imagem) para extração via OCR.
 
-    Args:
-        arquivo: Arquivo (PDF, PNG, JPEG, etc.) contendo a nota fiscal.
-
-    Returns:
-        job_id e status inicial 'pendente'.
+    Processamento assíncrono — retorna job_id para polling.
+    Para XML de NF-e, prefira POST /ia/processar-nfe-xml (síncrono, mais preciso).
     """
-    # Aplica rate limit específico para IA
     await check_ia_rate_limit(current_user["user_id"])
-    # Usa slot global para processamento pesado (OCR)
     await acquire_ia_slot()
     try:
-        # Lê o arquivo e valida tamanho (max 10MB)
         conteudo = await arquivo.read()
-        if len(conteudo) > 10 * 1024 * 1024:  # 10MB
+        if len(conteudo) > 10 * 1024 * 1024:
             raise HTTPException(
                 status_code=413,
-                detail=error_detail("ARQUIVO_MUITO_GRANDE", "Arquivo excede o limite de 10MB")
+                detail=error_detail("ARQUIVO_MUITO_GRANDE", "Arquivo excede 10MB"),
             )
 
-        # Valida extensão (opcional)
-        nome_arquivo = arquivo.filename or ""
-        extensoes_validas = ('.pdf', '.png', '.jpg', '.jpeg', '.tiff', '.bmp')
-        if not any(nome_arquivo.lower().endswith(ext) for ext in extensoes_validas):
+        extensoes_validas = (".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".bmp")
+        nome = arquivo.filename or ""
+        if not any(nome.lower().endswith(ext) for ext in extensoes_validas):
             raise HTTPException(
                 status_code=400,
                 detail=error_detail(
                     "FORMATO_INVALIDO",
-                    f"Formato de arquivo não suportado. Use: {', '.join(extensoes_validas)}"
-                )
+                    f"Use: {', '.join(extensoes_validas)}. Para XML use /ia/processar-nfe-xml.",
+                ),
             )
 
-        # Cria job na tabela ia_jobs
         try:
             job_id = await enfileirar_job_ocr(conteudo, uuid.UUID(current_user["user_id"]))
         except ValueError as e:
-            # Exceção levantada pela função OCR quando não consegue extrair dados
-            logger.warning("Falha na extração de dados da nota: %s", str(e))
             raise HTTPException(
                 status_code=422,
-                detail=error_detail("DADOS_NAO_EXTRAIDOS", str(e))
+                detail=error_detail("DADOS_NAO_EXTRAIDOS", str(e)),
             )
         except Exception as e:
             logger.exception("Erro ao enfileirar job de OCR")
             raise HTTPException(
                 status_code=500,
-                detail=error_detail("ERRO_INTERNO", f"Erro ao enfileirar job: {str(e)}")
+                detail=error_detail("ERRO_INTERNO", f"Erro ao enfileirar job: {e}"),
             )
 
         return {
             "job_id": str(job_id),
             "status": "pendente",
-            "message": "Nota fiscal enviada para processamento. Consulte o status com GET /ia/processar-nota/jobs/{job_id}"
+            "message": "Nota enviada para processamento. Consulte GET /ia/processar-nota/jobs/{job_id}",
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Erro ao processar nota: %s", e)
+        logger.exception("Erro ao processar nota")
         raise HTTPException(
             status_code=500,
-            detail=error_detail("ERRO_INTERNO", f"Erro ao processar nota: {str(e)}")
+            detail=error_detail("ERRO_INTERNO", f"Erro ao processar nota: {e}"),
         )
     finally:
         await release_ia_slot()
@@ -242,50 +256,318 @@ async def processar_nota_fiscal(
 @router.get("/processar-nota/jobs/{job_id}")
 async def status_job_ocr(
     job_id: str,
-    current_user: dict = Depends(require_perfil("COMPRAS", "ADMIN"))
+    current_user: dict = Depends(require_perfil("COMPRAS", "ADMIN")),
 ):
-    """Consulta o status de um job de OCR de nota fiscal.
-
-    Args:
-        job_id: ID do job retornado por POST /ia/processar-nota.
-
-    Returns:
-        Status, resultado (se concluído) ou erro_motivo (se falhou).
-    """
+    """Consulta status de um job de OCR."""
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM ia_jobs WHERE id = $1 AND tipo = 'OCR_NOTA'",
-            uuid.UUID(job_id)
+            uuid.UUID(job_id),
         )
         if not row:
             raise HTTPException(
                 status_code=404,
-                detail=error_detail("RECURSO_NAO_ENCONTRADO", "Job não encontrado")
+                detail=error_detail("RECURSO_NAO_ENCONTRADO", "Job não encontrado"),
             )
-
-        # Verifica se o job pertence ao usuário (segurança)
         if row["solicitado_por"] != uuid.UUID(current_user["user_id"]):
             raise HTTPException(
                 status_code=403,
-                detail=error_detail("PERMISSAO_NEGADA", "Este job não pertence a você")
+                detail=error_detail("PERMISSAO_NEGADA", "Este job não pertence a você"),
             )
-
         return {
             "job_id": str(row["id"]),
             "status": row["status"],
             "resultado": row["resultado"],
             "erro_motivo": row["erro_motivo"],
             "criado_em": row["criado_em"],
-            "concluido_em": row["concluido_em"]
+            "concluido_em": row["concluido_em"],
         }
 
 
 # =====================================================================
-# Rotas existentes (prospecção, cotação online)
-# Mantidas inalteradas, apenas importadas.
+# NF-e XML — Parser direto (síncrono, sem OCR, sem polling)
 # =====================================================================
 
-# (As funções já existentes de prospecção e cotação online devem permanecer aqui.
-#  Para brevidade, não estão repetidas neste arquivo, mas na implementação real,
-#  elas devem estar presentes.)
+@router.post("/processar-nfe-xml", status_code=202)
+async def processar_nfe_xml(
+    arquivo: UploadFile = File(...),
+    current_user: dict = Depends(require_perfil("COMPRAS", "ADMIN")),
+):
+    """Processa XML de NF-e diretamente via ElementTree (sem OCR).
+
+    Diferente de /processar-nota (OCR assíncrono), este endpoint parseia
+    o XML estruturado da NF-e — campo a campo, namespace SEFAZ — e retorna
+    o resultado imediatamente. Muito mais confiável para CNPJ, valores e
+    itens do que OCR em PDF de DANFE.
+
+    Fluxo:
+      1. Parseia o XML (parsear_xml_nfe).
+      2. Busca ou cria fornecedor pelo CNPJ do emitente.
+      3. Tenta associar produtos a insumos existentes (EAN / nome similar).
+      4. Cria conta a pagar com o valor total da NF-e.
+
+    Retorna fornecedor, conta a pagar, itens associados e itens pendentes
+    de associação manual.
+    """
+    nome = arquivo.filename or ""
+    if not nome.lower().endswith(".xml"):
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail(
+                "FORMATO_INVALIDO",
+                "Este endpoint aceita apenas arquivos .xml de NF-e. "
+                "Para PDF ou imagem, use POST /ia/processar-nota.",
+            ),
+        )
+
+    conteudo = await arquivo.read()
+    if len(conteudo) > 5 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=error_detail("ARQUIVO_MUITO_GRANDE", "XML excede o limite de 5MB"),
+        )
+
+    try:
+        dados = parsear_xml_nfe(conteudo)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=error_detail("XML_NFE_INVALIDO", str(e)),
+        )
+    except Exception as e:
+        logger.exception("Erro ao parsear XML de NF-e")
+        raise HTTPException(
+            status_code=500,
+            detail=error_detail("ERRO_INTERNO", f"Erro ao processar XML: {e}"),
+        )
+
+    try:
+        resultado = await salvar_nfe_xml(dados, uuid.UUID(current_user["user_id"]))
+    except Exception as e:
+        logger.exception("Erro ao salvar NF-e no banco")
+        raise HTTPException(
+            status_code=500,
+            detail=error_detail("ERRO_INTERNO", f"Erro ao salvar dados da NF-e: {e}"),
+        )
+
+    return {"status": "processado", "fonte": "XML_NFE", **resultado}
+
+
+@router.post("/validar-nfe-xml")
+async def validar_nfe_xml(
+    arquivo: UploadFile = File(...),
+    current_user: dict = Depends(require_perfil("COMPRAS", "ADMIN")),
+):
+    """Valida e extrai dados de XML de NF-e sem salvar no banco.
+
+    Útil para prévia antes de confirmar o processamento.
+    """
+    nome = arquivo.filename or ""
+    if not nome.lower().endswith(".xml"):
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail("FORMATO_INVALIDO", "Aceita apenas arquivos .xml de NF-e"),
+        )
+
+    conteudo = await arquivo.read()
+    try:
+        dados = parsear_xml_nfe(conteudo)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=error_detail("XML_NFE_INVALIDO", str(e)),
+        )
+
+    return {
+        "valido": True,
+        "identificacao": dados["identificacao"],
+        "emitente": {
+            "cnpj": dados["emitente"].get("cnpj"),
+            "razao_social": dados["emitente"].get("razao_social"),
+            "nome_fantasia": dados["emitente"].get("nome_fantasia"),
+            "municipio": dados["emitente"].get("municipio"),
+            "uf": dados["emitente"].get("uf"),
+        },
+        "total_produtos": len(dados["produtos"]),
+        "produtos": dados["produtos"],
+        "totais": dados["totais"],
+    }
+
+
+# =====================================================================
+# Prospecção de Pratos
+# =====================================================================
+
+@router.get("/prospeccao-pratos/insumos-criticos")
+async def insumos_criticos(
+    dias: int = 7,
+    _: dict = Depends(require_perfil("CHEF", "COMPRAS", "ADMIN")),
+):
+    """Lista insumos vencendo em até N dias — input para prospecção."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        return {"dias": dias, "insumos": await _insumos_criticos(conn, dias)}
+
+
+@router.post("/prospeccao-pratos", status_code=202)
+async def solicitar_prospeccao(
+    body: ProspeccaoRequest,
+    current_user: dict = Depends(require_perfil("CHEF", "ADMIN")),
+):
+    """Prospecta pratos executáveis com base no estoque atual.
+
+    Match direto (pratos cadastrados que usam os insumos) é real.
+    Sugestão criativa (LLM) retorna aviso enquanto não houver provedor.
+    """
+    await check_ia_rate_limit(current_user["user_id"])
+    await acquire_ia_slot()
+    try:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            job = await conn.fetchrow(
+                """INSERT INTO ia_jobs (tipo, solicitado_por, entrada)
+                   VALUES ('PROSPECCAO_PRATOS', $1, $2) RETURNING id""",
+                uuid.UUID(current_user["user_id"]),
+                {
+                    "criterio": body.criterio,
+                    "insumo_ids": body.insumo_ids,
+                    "estilo_menu": body.estilo_menu,
+                    "dias_vencimento": body.dias_vencimento,
+                },
+            )
+
+            if body.criterio == "MANUAL" and body.insumo_ids:
+                ids_alvo = [uuid.UUID(i) for i in body.insumo_ids]
+                alvo = await conn.fetch(
+                    "SELECT id AS insumo_id, nome FROM insumos WHERE id = ANY($1::uuid[])",
+                    ids_alvo,
+                )
+                alvo = [dict(r) for r in alvo]
+            else:
+                alvo = await _insumos_criticos(conn, body.dias_vencimento)
+
+            ids_alvo = [uuid.UUID(str(a["insumo_id"])) for a in alvo]
+            match_direto = []
+            if ids_alvo:
+                rows = await conn.fetch(
+                    """SELECT DISTINCT p.id AS prato_id, p.nome, p.genero_prato
+                         FROM pratos p JOIN itens_receita ir ON ir.prato_id = p.id
+                        WHERE ir.insumo_id = ANY($1::uuid[]) AND p.status = 'ATIVO'""",
+                    ids_alvo,
+                )
+                match_direto = [dict(r) for r in rows]
+
+            resultado = {
+                "insumos_considerados": alvo,
+                "match_direto": match_direto,
+                "sugestoes_criativas": [],
+                "aviso": None,
+            }
+            try:
+                resultado["sugestoes_criativas"] = await _sugerir_pratos_criativos(
+                    alvo, body.estilo_menu
+                )
+            except NotImplementedError as e:
+                resultado["aviso"] = str(e)
+
+            import json as _json
+            await conn.execute(
+                "UPDATE ia_jobs SET status = 'concluido', resultado = $2, concluido_em = now() WHERE id = $1",
+                job["id"],
+                _json.dumps(resultado),
+            )
+            return {"job_id": str(job["id"])}
+    finally:
+        await release_ia_slot()
+
+
+@router.get("/prospeccao-pratos/jobs/{job_id}", response_model=JobOut)
+async def status_job_prospeccao(job_id: str):
+    """Consulta status/resultado de um job de prospecção."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM ia_jobs WHERE id = $1 AND tipo = 'PROSPECCAO_PRATOS'",
+            uuid.UUID(job_id),
+        )
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=error_detail("RECURSO_NAO_ENCONTRADO", "Job não encontrado"),
+            )
+        return JobOut(
+            job_id=str(row["id"]),
+            status=row["status"],
+            resultado=row["resultado"],
+            erro_motivo=row["erro_motivo"],
+        )
+
+
+# =====================================================================
+# Cotação Online via IA
+# =====================================================================
+
+@router.post("/cotacoes/ia-online", status_code=202)
+async def solicitar_cotacao_ia(
+    body: CotacaoOnlineRequest,
+    current_user: dict = Depends(require_perfil("COMPRAS", "ADMIN")),
+):
+    """Dispara busca de preços online via agente de IA.
+
+    Resultado entra como Cotacao com status=PENDENTE_REVISAO —
+    nunca aplicado automaticamente ao custo sem aprovação humana.
+    Sem adapter configurado, job termina em erro explícito.
+    """
+    await check_ia_rate_limit(current_user["user_id"])
+    await acquire_ia_slot()
+    try:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            job = await conn.fetchrow(
+                """INSERT INTO ia_jobs (tipo, solicitado_por, entrada)
+                   VALUES ('COTACAO_ONLINE', $1, $2) RETURNING id""",
+                uuid.UUID(current_user["user_id"]),
+                {"insumo_ids": body.insumo_ids, "fornecedores_alvo": body.fornecedores_alvo},
+            )
+            try:
+                resultado = await _buscar_precos_externos(
+                    body.insumo_ids, body.fornecedores_alvo
+                )
+                import json as _json
+                await conn.execute(
+                    "UPDATE ia_jobs SET status = 'concluido', resultado = $2, concluido_em = now() WHERE id = $1",
+                    job["id"],
+                    _json.dumps(resultado),
+                )
+            except NotImplementedError as e:
+                await conn.execute(
+                    "UPDATE ia_jobs SET status = 'erro', erro_motivo = $2, concluido_em = now() WHERE id = $1",
+                    job["id"],
+                    str(e),
+                )
+            return {"job_id": str(job["id"])}
+    finally:
+        await release_ia_slot()
+
+
+@router.get("/cotacoes/ia-online/jobs/{job_id}", response_model=JobOut)
+async def status_job_cotacao(job_id: str):
+    """Consulta status de um job de cotação online."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM ia_jobs WHERE id = $1 AND tipo = 'COTACAO_ONLINE'",
+            uuid.UUID(job_id),
+        )
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=error_detail("RECURSO_NAO_ENCONTRADO", "Job não encontrado"),
+            )
+        return JobOut(
+            job_id=str(row["id"]),
+            status=row["status"],
+            resultado=row["resultado"],
+            erro_motivo=row["erro_motivo"],
+        )
