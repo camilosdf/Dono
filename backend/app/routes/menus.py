@@ -77,7 +77,12 @@ async def _menu_out(conn, r, incluir_itens: bool = True) -> MenuOut:
 
 
 @router.get("/menus", response_model=Page)
-async def listar_menus(data_inicio: date | None = None, status: str | None = None, pag: PageParams = Depends()):
+async def listar_menus(
+    data_inicio: date | None = None,
+    status: str | None = None,
+    pag: PageParams = Depends(),
+    _: dict = Depends(require_perfil("CHEF", "GESTAO", "ADMIN", "COMPRAS")),
+):
     pool = get_pool()
     async with pool.acquire() as conn:
         where = "($1::date IS NULL OR data_inicio = $1) AND ($2::varchar IS NULL OR status = $2)"

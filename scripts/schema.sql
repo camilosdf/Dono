@@ -442,11 +442,11 @@ RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.status = 'CONFIRMADO' AND OLD.status <> 'CONFIRMADO' THEN
         UPDATE itens_menu im
-           SET custo_snapshot = (
-                SELECT SUM(ir.custo_snapshot * r.qtd_pessoas)
-                  FROM itens_refeicao ir
-                  JOIN refeicoes r ON r.id = ir.refeicao_id
-                 WHERE ir.refeicao_id = im.refeicao_id
+            SET custo_snapshot = (
+                SELECT COALESCE(SUM(COALESCE(ir.custo_snapshot, 0) * r.qtd_pessoas), 0)
+                FROM itens_refeicao ir
+                JOIN refeicoes r ON r.id = ir.refeicao_id
+                WHERE ir.refeicao_id = im.refeicao_id
            )
          WHERE im.menu_id = NEW.id;
 

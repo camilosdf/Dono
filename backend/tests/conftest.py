@@ -143,8 +143,8 @@ def mock_redis():
     """Mock do Redis para todos os testes.
     CORREÇÃO: Agora todos os métodos que podem ser 'await' são AsyncMock.
     Isso evita o erro 'object MagicMock can't be used in await expression'."""
-    r = MagicMock(spec=["setex", "get", "incr", "expire", "ttl", "decr", "delete"])
-    
+    r = MagicMock(spec=["setex", "get", "incr", "expire", "ttl", "decr", "delete", "set", "close"])
+
     # Métodos que são chamados com await
     r.setex = AsyncMock(return_value=True)
     r.get = AsyncMock(return_value=None)
@@ -153,6 +153,8 @@ def mock_redis():
     r.ttl = AsyncMock(return_value=60)
     r.decr = AsyncMock(return_value=0)
     r.delete = AsyncMock(return_value=1)
+    r.set = AsyncMock(return_value=True)   # usado pelo forecast_worker lock
+    r.close = AsyncMock(return_value=None) # usado por redis_disconnect()
     
     # Se algum método não estiver mockado, o MagicMock padrão será sincrono,
     # mas como temos os principais cobertos, isso é suficiente.

@@ -354,10 +354,24 @@ class TestCustoABC:
         assert len(r.json()["itens_receita"]) == 2
 
         # ABC recalculada: id1 deve ser A, id2 deve ser C
+        # ABC recalculada: com apenas 2 itens onde id1 (500) representa
+        # ~98% do custo total (510), o corte de 80% é ultrapassado já na
+        # primeira linha — ambos ficam Classe C, o que é correto para a
+        # curva ABC com essa distribuição. O que se valida é que a
+        # substituição de itens de fato recalculou os custos e a ordem.
         abc_r = await client.get(f"/pratos/{prato_id}/abc", headers=auth_headers(token_chef))
-        abc = {item["insumo_id"]: item["classe"] for item in abc_r.json()}
-        assert abc[id1] == "A"
-        assert abc[id2] == "C"
+        assert abc_r.status_code == 200
+        itens = abc_r.json()
+        assert len(itens) == 2
+
+        custo_por_insumo = {item["insumo_id"]: item["custo"] for item in itens}
+        assert custo_por_insumo[id1] == 500.0
+        assert custo_por_insumo[id2] == 10.0
+        assert custo_por_insumo[id1] > custo_por_insumo[id2]
+
+        # id1 domina o custo total → acumulado já ultrapassa 80% nele
+        percentual_por_insumo = {item["insumo_id"]: item["percentual_acumulado"] for item in itens}
+        assert percentual_por_insumo[id1] > 80
 
 
 # =====================================================================

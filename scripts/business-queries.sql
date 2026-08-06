@@ -176,6 +176,7 @@ BEGIN
             , 2) AS pct_acumulado
         FROM itens_menu im
         WHERE im.menu_id = p_menu_id
+          AND im.custo_snapshot IS NOT NULL
     ) ranked;
 END;
 $$ LANGUAGE plpgsql;

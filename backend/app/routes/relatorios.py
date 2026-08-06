@@ -13,7 +13,7 @@
 
 import asyncpg
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -39,7 +39,7 @@ def _slug_titulo(titulo: str) -> str:
 @router.get("/curva-abc")
 async def curva_abc(
     id: uuid.UUID,  # <-- MOVIDO PARA ANTES do escopo (sem padrão primeiro)
-    escopo: str = Query(..., pattern="^(INSUMO_GENERO|PRATO|REFEICAO|MENU)$"),
+    escopo: str = Query(...),
     formato: Optional[str] = Query("json", pattern="^(json|pdf|xlsx)$"),
     current_user: dict = Depends(require_perfil("ADMIN", "GESTAO", "COMPRAS"))
 ):
@@ -47,6 +47,12 @@ async def curva_abc(
     Classificação ABC para o escopo informado.
     Lê diretamente da tabela materializada `classificacoes_abc`.
     """
+    ESCOPOS_VALIDOS = {"INSUMO_GENERO", "PRATO", "REFEICAO", "MENU"}
+    if escopo not in ESCOPOS_VALIDOS:
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail("VALIDACAO_INVALIDA", f"Escopo inválido. Use: {', '.join(sorted(ESCOPOS_VALIDOS))}")
+        )
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -88,14 +94,12 @@ async def curva_abc(
 # ---------- 2. MRP (Previsão de Compras) ----------
 @router.get("/mrp")
 async def mrp(
-    data_limite: date = Query(..., description="Data limite para análise (ex.: data do evento mais distante)"),
+    data_limite: Optional[date] = Query(None, description="Data limite para análise. Default: 30 dias à frente."),
     formato: Optional[str] = Query("json", pattern="^(json|pdf|xlsx)$"),
     current_user: dict = Depends(require_perfil("ADMIN", "COMPRAS"))
 ):
-    """
-    MRP – Material Requirements Planning.
-    Executa a função fn_mrp_previsao_compras() e retorna a lista de compras sugeridas.
-    """
+    if data_limite is None:
+        data_limite = date.today() + timedelta(days=30)
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -105,7 +109,7 @@ async def mrp(
         data = [dict(r) for r in rows]
 
         if formato == "json":
-            return data
+            return {"itens": data, "data_limite": data_limite.isoformat()}
 
         titulo = f"MRP - Necessidades de Compra até {data_limite.isoformat()}"
         secoes = [_secao_relatorio(
@@ -147,34 +151,35 @@ async def ruptura_estoque(
         # 1. Insumos com saldo zero (ruptura total)
         insumos_zerados = await conn.fetch(
             """
-            SELECT 
+            SELECT
                 i.id AS insumo_id,
                 i.nome AS insumo_nome,
                 i.unidade,
                 c.nome AS categoria_nome
-            FROM projecao_estoque_atual p
-            JOIN insumos i ON i.id = p.insumo_id
+            FROM insumos i
             JOIN categorias c ON c.id = i.categoria_id
-            WHERE p.saldo_atual = 0
-            GROUP BY i.id, i.nome, i.unidade, c.nome
+            WHERE i.ativo = TRUE
+              AND COALESCE((
+                  SELECT SUM(l.quantidade_disponivel)
+                    FROM lotes_insumo l
+                   WHERE l.insumo_id = i.id
+              ), 0) = 0
             ORDER BY i.nome
             """
         )
 
-        # 2. Lotes vencendo nos próximos N dias (com saldo disponível)
-        # CORREÇÃO: usar $1 * INTERVAL '1 day' para evitar erro de tipo
+        # 2. Lotes vencendo nos próximos N dias — consulta direta em lotes_insumo
         lotes_vencendo = await conn.fetch(
             """
-            SELECT 
+            SELECT
                 l.id AS lote_id,
                 l.insumo_id,
                 i.nome AS insumo_nome,
                 l.data_validade,
                 l.quantidade_disponivel,
-                p.saldo_atual AS saldo_atual_lote
+                l.quantidade_disponivel AS saldo_atual_lote
             FROM lotes_insumo l
             JOIN insumos i ON i.id = l.insumo_id
-            JOIN projecao_estoque_atual p ON p.lote_insumo_id = l.id
             WHERE l.data_validade IS NOT NULL
               AND l.data_validade BETWEEN CURRENT_DATE AND CURRENT_DATE + ($1 * INTERVAL '1 day')
               AND l.quantidade_disponivel > 0
@@ -234,6 +239,12 @@ async def consumo(
     no período especificado. Se nenhum período for informado, considera
     todo o histórico.
     """
+    pool = get_pool()
+    if periodo_inicio and periodo_fim and periodo_inicio > periodo_fim:
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail("PERIODO_INVALIDO", "periodo_inicio deve ser anterior a periodo_fim")
+        )
     pool = get_pool()
     async with pool.acquire() as conn:
         # Monta a cláusula WHERE
@@ -353,23 +364,22 @@ async def margem_menu(
         # Busca os itens do menu com custo snapshot e preços de venda dos pratos
         rows = await conn.fetch(
             """
-            SELECT 
+            SELECT
                 im.id AS item_menu_id,
                 im.refeicao_id,
                 r.genero_refeicao,
+                r.qtd_pessoas,
                 im.custo_snapshot AS custo_total_refeicao,
                 COALESCE((
-                    SELECT SUM(p.preco_venda_praticado * ir.custo_snapshot / NULLIF(r2.qtd_pessoas, 0))
-                    FROM itens_refeicao ir
-                    JOIN pratos p ON p.id = ir.prato_id
-                    WHERE ir.refeicao_id = im.refeicao_id
+                    SELECT SUM(p.preco_venda_praticado * r.qtd_pessoas)
+                      FROM itens_refeicao ir
+                      JOIN pratos p ON p.id = ir.prato_id
+                     WHERE ir.refeicao_id = im.refeicao_id
+                       AND p.preco_venda_praticado IS NOT NULL
                 ), 0) AS receita_total_estimada
             FROM itens_menu im
             JOIN refeicoes r ON r.id = im.refeicao_id
-            LEFT JOIN itens_refeicao ir ON ir.refeicao_id = im.refeicao_id
-            LEFT JOIN pratos p ON p.id = ir.prato_id
             WHERE im.menu_id = $1
-            GROUP BY im.id, im.refeicao_id, r.genero_refeicao, im.custo_snapshot
             ORDER BY im.ordem_cronologica
             """,
             menu_id
@@ -381,7 +391,7 @@ async def margem_menu(
         dados = {
             "menu_id": str(menu_id),
             "nome_evento": menu["nome_evento"],
-            "itens": [dict(r) for r in rows]
+            "refeicoes": [dict(r) for r in rows]
         }
 
         if formato == "json":
@@ -395,7 +405,7 @@ async def margem_menu(
                 [("Refeição", "genero_refeicao"), ("Custo Total (R$)", "custo_total_refeicao"),
                  ("Receita Estimada (R$)", "receita_total_estimada"),
                  ("Margem (R$)", lambda row: row["receita_total_estimada"] - row["custo_total_refeicao"])],
-                dados["itens"]
+                dados["refeicoes"]
             )
         ]
 

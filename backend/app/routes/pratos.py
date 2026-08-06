@@ -203,32 +203,37 @@ async def atualizar_prato(prato_id: str, body: AtualizarPratoRequest, _: dict = 
 async def substituir_itens_receita(prato_id: str, itens: list[ItemReceitaIn],
                                     _: dict = Depends(require_perfil("CHEF", "ADMIN"))):
     pool = get_pool()
-    async with pool.acquire() as conn, conn.transaction():
-        prato = await conn.fetchrow("SELECT * FROM pratos WHERE id = $1", uuid.UUID(prato_id))
-        if not prato:
-            raise HTTPException(status_code=404, detail=error_detail("RECURSO_NAO_ENCONTRADO", "Prato não encontrado"))
-        await conn.execute("DELETE FROM itens_receita WHERE prato_id = $1", uuid.UUID(prato_id))
-        for item in itens:
-            custo_unitario = await conn.fetchval(
-                "SELECT custo_medio_ponderado FROM insumos WHERE id = $1", uuid.UUID(item.insumo_id)
-            )
-            if custo_unitario is None:
-                raise HTTPException(status_code=400, detail=error_detail(
-                    "VALIDACAO_INVALIDA", f"Insumo {item.insumo_id} não encontrado"))
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            prato = await conn.fetchrow("SELECT * FROM pratos WHERE id = $1", uuid.UUID(prato_id))
+            if not prato:
+                raise HTTPException(status_code=404, detail=error_detail("RECURSO_NAO_ENCONTRADO", "Prato não encontrado"))
+            await conn.execute("DELETE FROM itens_receita WHERE prato_id = $1", uuid.UUID(prato_id))
+            for item in itens:
+                custo_unitario = await conn.fetchval(
+                    "SELECT custo_medio_ponderado FROM insumos WHERE id = $1", uuid.UUID(item.insumo_id)
+                )
+                if custo_unitario is None:
+                    raise HTTPException(status_code=400, detail=error_detail(
+                        "VALIDACAO_INVALIDA", f"Insumo {item.insumo_id} não encontrado"))
+                await conn.execute(
+                    """INSERT INTO itens_receita (prato_id, insumo_id, tipo, peso_bruto, fator_correcao,
+                                                   custo_unitario_registrado)
+                       VALUES ($1,$2,$3,$4,$5,$6)""",
+                    uuid.UUID(prato_id), uuid.UUID(item.insumo_id), item.tipo, item.peso_bruto,
+                    item.fator_correcao, custo_unitario,
+                )
+            # Limpa ABC dentro da transação — a reinserção abaixo ocorre fora,
+            # após commit, para garantir que custo_total_calculado (GENERATED)
+            # já esteja materializado quando fn_recalcular_abc_prato rodar.
             await conn.execute(
-                """INSERT INTO itens_receita (prato_id, insumo_id, tipo, peso_bruto, fator_correcao,
-                                               custo_unitario_registrado)
-                   VALUES ($1,$2,$3,$4,$5,$6)""",
-                uuid.UUID(prato_id), uuid.UUID(item.insumo_id), item.tipo, item.peso_bruto,
-                item.fator_correcao, custo_unitario,
+                "DELETE FROM classificacoes_abc WHERE escopo_tipo = 'PRATO' AND escopo_id_pai = $1",
+                uuid.UUID(prato_id)
             )
-        # Mesmo motivo do POST /pratos: ABC de PRATO não pode esperar o
-        # worker aqui, porque substituir a receita não é um evento de
-        # preço — é a receita mudando, e o worker só escuta preço mudar.
-        await conn.execute("DELETE FROM classificacoes_abc WHERE escopo_tipo = 'PRATO' AND escopo_id_pai = $1",
-                            uuid.UUID(prato_id))
+        # Fora da transaction: colunas GENERATED já materializadas pós-commit.
         if itens:
             await conn.fetchval("SELECT fn_recalcular_abc_prato($1)", uuid.UUID(prato_id))
+        prato = await conn.fetchrow("SELECT * FROM pratos WHERE id = $1", uuid.UUID(prato_id))
         return await _prato_out(conn, prato)
 
 

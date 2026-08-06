@@ -326,8 +326,9 @@ class TestRegrasComposicao:
         """Seeds carregam regras para 9 gêneros de refeição."""
         r = await client.get("/regras-composicao")
         assert r.status_code == 200
-        # Total de regras nos seeds: 6+2+6+2+6+6+4+5+1 = 38
-        assert len(r.json()) == 38
+        # Total de regras nos seeds: 6+2+6+2+6+6+4+5+3 = 40
+        # (Colação passou a ter 3 regras: Frios/Laticínios, Padaria, Bebida Quente)
+        assert len(r.json()) == 40
 
     async def test_listar_regras_filtro_genero(self, client):
         r = await client.get("/regras-composicao?genero_refeicao=Almo%C3%A7o%20Executivo")
@@ -345,11 +346,12 @@ class TestRegrasComposicao:
         }
         assert generos == esperados
 
-    async def test_regras_colacao_apenas_frios_laticinios(self, client):
-        """Colação tem apenas 1 regra: Frios/Laticínios."""
+    async def test_regras_colacao_composicao_completa(self, client):
+        """Colação tem 3 regras: Frios/Laticínios, Padaria e Bebida Quente."""
         r = await client.get("/regras-composicao?genero_refeicao=Cola%C3%A7%C3%A3o")
-        assert len(r.json()) == 1
-        assert r.json()[0]["genero_prato_obrigatorio"] == "Frios/Laticínios"
+        assert len(r.json()) == 3
+        generos = {reg["genero_prato_obrigatorio"] for reg in r.json()}
+        assert generos == {"Frios/Laticínios", "Padaria", "Bebida Quente"}
 
     async def test_criar_regra_composicao(self, client, token_admin):
         r = await client.post(
