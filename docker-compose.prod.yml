@@ -95,6 +95,7 @@ services:
     container_name: dono-api-prod
     environment:
       DATABASE_URL: postgresql://dono:${DB_PASSWORD}@db:5432/dono
+      TEST_DATABASE_URL: postgresql://dono:${DB_PASSWORD}@db:5432/dono_test
       REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET:?defina JWT_SECRET no .env}
       JWT_ISSUER: "Dono"
@@ -113,6 +114,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
     healthcheck:
       test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
@@ -289,7 +292,7 @@ volumes:
   postgres_data:
   redis_data:
   ollama_data:
-
+  
 # -------------------------------------------------------------------------
 # Rede interna isolada
 # -------------------------------------------------------------------------

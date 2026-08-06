@@ -565,5 +565,5 @@ class TestPermissoesPratos:
         assert r.status_code == 204
 
     async def test_sem_token_retorna_401(self, client):
-        r = await client.get("/pratos")
+        r = await client.post("/pratos", json={})
         assert r.status_code == 401

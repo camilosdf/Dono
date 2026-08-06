@@ -250,10 +250,13 @@ async def aprovar_prato(prato_id: str, _: dict = Depends(require_perfil("CHEF", 
 async def remover_prato(prato_id: str, _: dict = Depends(require_perfil("ADMIN"))):
     pool = get_pool()
     async with pool.acquire() as conn:
-        try:
-            await conn.execute("UPDATE pratos SET status = 'INATIVO' WHERE id = $1", uuid.UUID(prato_id))
-        except asyncpg.ForeignKeyViolationError:
+        em_uso = await conn.fetchval(
+            "SELECT 1 FROM itens_refeicao WHERE prato_id = $1 LIMIT 1",
+            uuid.UUID(prato_id),
+        )
+        if em_uso:
             raise HTTPException(status_code=409, detail=error_detail("PRATO_EM_USO", "Prato em uso em alguma refeição"))
+        await conn.execute("UPDATE pratos SET status = 'INATIVO' WHERE id = $1", uuid.UUID(prato_id))
 
 
 @router.get("/pratos/{prato_id}/abc")
