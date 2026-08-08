@@ -27,6 +27,7 @@ from app.rag import (
     buscar_documentos_similares,
     consultar_llm,
     enfileirar_job_ocr,
+    enfileirar_job_cotacao_documento,
 )
 from app.rate_limit import acquire_ia_slot, check_ia_rate_limit, release_ia_slot
 
@@ -263,6 +264,130 @@ async def status_job_ocr(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM ia_jobs WHERE id = $1 AND tipo = 'OCR_NOTA'",
+            uuid.UUID(job_id),
+        )
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=error_detail("RECURSO_NAO_ENCONTRADO", "Job não encontrado"),
+            )
+        if row["solicitado_por"] != uuid.UUID(current_user["user_id"]):
+            raise HTTPException(
+                status_code=403,
+                detail=error_detail("PERMISSAO_NEGADA", "Este job não pertence a você"),
+            )
+        return {
+            "job_id": str(row["id"]),
+            "status": row["status"],
+            "resultado": row["resultado"],
+            "erro_motivo": row["erro_motivo"],
+            "criado_em": row["criado_em"],
+            "concluido_em": row["concluido_em"],
+        }
+
+
+# =====================================================================
+# Importação de Cotação — Documentos (PDF/XML/XLSX)
+# =====================================================================
+
+_EXTENSAO_PARA_FORMATO_COTACAO = {".pdf": "pdf", ".xml": "xml", ".xlsx": "xlsx"}
+
+
+@router.post("/importar-cotacao", status_code=202)
+async def importar_cotacao_documento(
+    arquivo: UploadFile = File(...),
+    fornecedor_id: Optional[str] = None,
+    current_user: dict = Depends(require_perfil("COMPRAS", "ADMIN")),
+):
+    """Envia um documento de cotação (PDF, XML ou XLSX) para extração
+    assistida por IA local.
+
+    Diferente da NF-e (schema legal fixo), cotações não têm formato
+    padronizado — a extração é feita por LLM local (Ollama) sobre o texto
+    do documento. Itens associados a insumo e fornecedor existentes viram
+    cotações pendentes de revisão (origem='IA_IMPORTADA'). Itens sem
+    associação clara retornam como itens_pendentes, sem persistir nada.
+
+    fornecedor_id (opcional): se o fornecedor já é conhecido, informe para
+    não depender de o LLM identificá-lo corretamente no texto do documento.
+
+    Processamento assíncrono — retorna job_id para polling em
+    GET /ia/importar-cotacao/jobs/{job_id}.
+    """
+    await check_ia_rate_limit(current_user["user_id"])
+    await acquire_ia_slot()
+    try:
+        nome = arquivo.filename or ""
+        extensao = next(
+            (ext for ext in _EXTENSAO_PARA_FORMATO_COTACAO if nome.lower().endswith(ext)),
+            None,
+        )
+        if not extensao:
+            raise HTTPException(
+                status_code=400,
+                detail=error_detail(
+                    "FORMATO_INVALIDO",
+                    f"Use um de: {', '.join(_EXTENSAO_PARA_FORMATO_COTACAO.keys())}",
+                ),
+            )
+        formato = _EXTENSAO_PARA_FORMATO_COTACAO[extensao]
+
+        conteudo = await arquivo.read()
+        if len(conteudo) > 10 * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail=error_detail("ARQUIVO_MUITO_GRANDE", "Arquivo excede 10MB"),
+            )
+
+        fornecedor_uuid = None
+        if fornecedor_id:
+            try:
+                fornecedor_uuid = uuid.UUID(fornecedor_id)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=error_detail("VALIDACAO_INVALIDA", "fornecedor_id inválido"),
+                )
+
+        try:
+            job_id = await enfileirar_job_cotacao_documento(
+                conteudo, formato, uuid.UUID(current_user["user_id"]), fornecedor_uuid,
+            )
+        except Exception as e:
+            logger.exception("Erro ao enfileirar job de importação de cotação")
+            raise HTTPException(
+                status_code=500,
+                detail=error_detail("ERRO_INTERNO", f"Erro ao enfileirar job: {e}"),
+            )
+
+        return {
+            "job_id": str(job_id),
+            "status": "pendente",
+            "message": "Documento enviado para processamento. Consulte GET /ia/importar-cotacao/jobs/{job_id}",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Erro ao importar cotação")
+        raise HTTPException(
+            status_code=500,
+            detail=error_detail("ERRO_INTERNO", f"Erro ao importar cotação: {e}"),
+        )
+    finally:
+        await release_ia_slot()
+
+
+@router.get("/importar-cotacao/jobs/{job_id}")
+async def status_job_cotacao_documento(
+    job_id: str,
+    current_user: dict = Depends(require_perfil("COMPRAS", "ADMIN")),
+):
+    """Consulta status de um job de importação de cotação."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM ia_jobs WHERE id = $1 AND tipo = 'COTACAO_DOCUMENTO'",
             uuid.UUID(job_id),
         )
         if not row:

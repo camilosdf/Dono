@@ -223,6 +223,52 @@ async def enfileirar_job_ocr(arquivo_bytes: bytes, usuario_id: uuid.UUID) -> uui
     return job_id
 
 
+async def enfileirar_job_cotacao_documento(
+    arquivo_bytes: bytes,
+    formato: str,
+    usuario_id: uuid.UUID,
+    fornecedor_id: Optional[uuid.UUID] = None,
+) -> uuid.UUID:
+    """Cria um job de importação de cotação (PDF/XML/XLSX) e armazena o
+    arquivo no Redis. Espelha enfileirar_job_ocr, mas para o pipeline de
+    extração de cotação via app.cotacao_import.
+
+    Args:
+        arquivo_bytes: Conteúdo do documento (PDF, XML ou XLSX).
+        formato: 'pdf', 'xml' ou 'xlsx'.
+        usuario_id: ID do usuário que solicitou o processamento.
+        fornecedor_id: Fornecedor já conhecido, se informado (evita
+            depender apenas do que o LLM conseguir identificar no texto).
+
+    Returns:
+        job_id: UUID do job criado.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        job = await conn.fetchrow(
+            """INSERT INTO ia_jobs (tipo, solicitado_por, entrada)
+               VALUES ('COTACAO_DOCUMENTO', $1, jsonb_build_object(
+                   'formato', $2,
+                   'fornecedor_id', $3,
+                   'timestamp', now()
+               ))
+               RETURNING id""",
+            usuario_id,
+            formato,
+            str(fornecedor_id) if fornecedor_id else None,
+        )
+        job_id = job["id"]
+
+    redis = get_redis()
+    await redis.setex(
+        f"cotacao_job:{job_id}:arquivo",
+        3600,
+        arquivo_bytes
+    )
+
+    return job_id
+
+
 async def enfileirar_job_rag(pergunta: str, usuario_id: uuid.UUID, top_k: int = 5) -> uuid.UUID:
     """Cria um job de RAG para processamento assíncrono (opcional).
     Atualmente a consulta RAG é síncrona, mas esta função serve como preparação

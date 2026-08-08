@@ -57,7 +57,7 @@ async def processar_proximo_job(db_pool: asyncpg.Pool) -> bool:
             """SELECT id, tipo, solicitado_por, entrada
                FROM ia_jobs
                WHERE status = 'pendente'
-                 AND tipo IN ('OCR_NOTA', 'RAG_CONSULTA')
+                 AND tipo IN ('OCR_NOTA', 'RAG_CONSULTA', 'COTACAO_DOCUMENTO')
                ORDER BY criado_em
                LIMIT 1
                FOR UPDATE SKIP LOCKED"""
@@ -93,6 +93,26 @@ async def processar_proximo_job(db_pool: asyncpg.Pool) -> bool:
 
                 # Processa o OCR (função em app.rag que chama app.ocr)
                 resultado = await processar_job_ocr(job_id, arquivo_bytes, usuario_id)
+
+            elif tipo == "COTACAO_DOCUMENTO":
+                from app.cotacao_import import processar_documento_cotacao
+
+                redis = get_redis()
+                arquivo_bytes = await redis.get(f"cotacao_job:{job_id}:arquivo")
+                if not arquivo_bytes:
+                    raise ValueError("Arquivo não encontrado no Redis (expirado ou não existe)")
+
+                formato = job["entrada"].get("formato")
+                fornecedor_hint = job["entrada"].get("fornecedor_id")
+                try:
+                    resultado = await processar_documento_cotacao(
+                        formato, arquivo_bytes, usuario_id,
+                        fornecedor_hint_id=uuid.UUID(fornecedor_hint) if fornecedor_hint else None,
+                    )
+                    resultado = {"status": "concluido", **resultado}
+                except ValueError as e:
+                    logger.warning("Falha na importação de cotação (job %s): %s", job_id, str(e))
+                    resultado = {"status": "erro", "erro_motivo": str(e)}
 
             elif tipo == "RAG_CONSULTA":
                 # (Futuro) Processamento de consulta RAG assíncrono

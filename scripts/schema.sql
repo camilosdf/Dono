@@ -115,7 +115,7 @@ CREATE TABLE cotacoes (
     preco_unitario      NUMERIC(12,4) NOT NULL,
     data_cotacao        DATE NOT NULL DEFAULT CURRENT_DATE,
     validade_cotacao    DATE,
-    origem              VARCHAR(10) NOT NULL CHECK (origem IN ('MANUAL', 'IA_ONLINE')),
+    origem              VARCHAR(15) NOT NULL CHECK (origem IN ('MANUAL', 'IA_ONLINE', 'IA_IMPORTADA')),
     status              VARCHAR(20) NOT NULL DEFAULT 'PENDENTE_REVISAO'
                             CHECK (status IN ('PENDENTE_REVISAO', 'APROVADA', 'REJEITADA')),
     aprovado_por        UUID REFERENCES usuarios(id),
@@ -312,7 +312,7 @@ CREATE INDEX idx_eventos_usuario ON eventos_dominio(usuario_id);
 -- ---------------------------------------------------------------------
 CREATE TABLE ia_jobs (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tipo            VARCHAR(30) NOT NULL CHECK (tipo IN ('COTACAO_ONLINE', 'PROSPECCAO_PRATOS', 'OCR_NOTA', 'RAG_CONSULTA')),
+    tipo            VARCHAR(30) NOT NULL CHECK (tipo IN ('COTACAO_ONLINE', 'PROSPECCAO_PRATOS', 'OCR_NOTA', 'RAG_CONSULTA', 'COTACAO_DOCUMENTO')),
     status          VARCHAR(20) NOT NULL DEFAULT 'pendente'
                         CHECK (status IN ('pendente', 'processando', 'concluido', 'erro')),
     solicitado_por  UUID NOT NULL REFERENCES usuarios(id),

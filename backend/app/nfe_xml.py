@@ -42,6 +42,86 @@ _NS_MAP = {"nfe": _NS}
 
 
 # =====================================================================
+# Helpers de associação (reutilizados por app.cotacao_import)
+# =====================================================================
+
+async def buscar_insumo_por_descricao(
+    conn: asyncpg.Connection,
+    descricao: str,
+    ean: Optional[str] = None,
+) -> Optional[uuid.UUID]:
+    """Tenta associar uma descrição de produto/item a um insumo cadastrado.
+    Ordem de tentativa: EAN (se disponível) → fragmentos da descrição via ILIKE.
+    Nunca cria insumo — associação incerta sempre exige revisão humana.
+    """
+    insumo_id = None
+
+    if ean and ean not in ("SEM GTIN", "0", "00000000000000"):
+        insumo_id = await conn.fetchval(
+            """SELECT id FROM insumos
+               WHERE marcas_aceitaveis @> ARRAY[$1]::text[]
+                  OR apresentacao ILIKE $1
+               LIMIT 1""",
+            ean,
+        )
+
+    if not insumo_id and descricao:
+        palavras = [p for p in descricao.split() if len(p) > 3][:3]
+        for palavra in palavras:
+            insumo_id = await conn.fetchval(
+                "SELECT id FROM insumos WHERE nome ILIKE $1 AND ativo = TRUE LIMIT 1",
+                f"%{palavra}%",
+            )
+            if insumo_id:
+                break
+
+    return insumo_id
+
+
+async def buscar_fornecedor_por_identificacao(
+    conn: asyncpg.Connection,
+    cnpj: Optional[str] = None,
+    nome: Optional[str] = None,
+    criar_se_ausente: bool = False,
+    contato_extra: Optional[str] = None,
+) -> Optional[uuid.UUID]:
+    """Tenta associar um fornecedor por CNPJ ou nome/razão social.
+    criar_se_ausente=True (usado pela NF-e, documento legal com CNPJ confiável)
+    cria o fornecedor automaticamente se não encontrado.
+    criar_se_ausente=False (usado por importações de cotação, fonte menos
+    confiável) apenas retorna None — a associação fica pendente de revisão.
+    """
+    fornecedor_id = None
+
+    if cnpj:
+        fornecedor_id = await conn.fetchval(
+            "SELECT id FROM fornecedores WHERE contato ILIKE $1 AND ativo = TRUE LIMIT 1",
+            f"%{cnpj}%",
+        )
+
+    if not fornecedor_id and nome:
+        fornecedor_id = await conn.fetchval(
+            "SELECT id FROM fornecedores WHERE nome ILIKE $1 AND ativo = TRUE LIMIT 1",
+            f"%{nome[:50]}%",
+        )
+
+    if not fornecedor_id and criar_se_ausente:
+        nome_fornecedor = nome or f"Fornecedor CNPJ {cnpj}"
+        contato_info = f"CNPJ: {cnpj}" if cnpj else ""
+        if contato_extra:
+            contato_info += f" | {contato_extra}" if contato_info else contato_extra
+
+        fornecedor_id = await conn.fetchval(
+            """INSERT INTO fornecedores (nome, contato, ativo)
+               VALUES ($1, $2, TRUE) RETURNING id""",
+            nome_fornecedor[:200],
+            contato_info[:200],
+        )
+        logger.info("Fornecedor criado: %s (CNPJ: %s)", nome_fornecedor, cnpj)
+
+    return fornecedor_id
+
+# =====================================================================
 # Helpers de extração
 # =====================================================================
 
@@ -284,47 +364,19 @@ async def salvar_nfe_xml(dados: Dict[str, Any], usuario_id: uuid.UUID) -> Dict[s
             # 1. Busca ou cria fornecedor pelo CNPJ
             # ----------------------------------------------------------
             cnpj = emit.get("cnpj") or emit.get("cpf")
-            fornecedor_id = None
+            municipio = emit.get("municipio", "")
+            uf = emit.get("uf", "")
+            contato_extra = f"{municipio}/{uf}" if municipio else None
+            if emit.get("telefone"):
+                contato_extra = f"{contato_extra} | Tel: {emit['telefone']}" if contato_extra else f"Tel: {emit['telefone']}"
 
-            # Tenta buscar por CNPJ (campo metadados->>'cnpj' ou contato LIKE)
-            if cnpj:
-                fornecedor_id = await conn.fetchval(
-                    "SELECT id FROM fornecedores WHERE contato ILIKE $1 AND ativo = TRUE LIMIT 1",
-                    f"%{cnpj}%",
-                )
-
-            # Tenta buscar por razão social
-            if not fornecedor_id and emit.get("razao_social"):
-                fornecedor_id = await conn.fetchval(
-                    "SELECT id FROM fornecedores WHERE nome ILIKE $1 AND ativo = TRUE LIMIT 1",
-                    f"%{emit['razao_social'][:50]}%",
-                )
-
-            # Cria fornecedor se não encontrou
-            if not fornecedor_id:
-                nome_fornecedor = (
-                    emit.get("nome_fantasia") or
-                    emit.get("razao_social") or
-                    f"Fornecedor CNPJ {cnpj}"
-                )
-                municipio = emit.get("municipio", "")
-                uf = emit.get("uf", "")
-                contato_info = f"CNPJ: {cnpj}"
-                if municipio:
-                    contato_info += f" | {municipio}/{uf}"
-                if emit.get("telefone"):
-                    contato_info += f" | Tel: {emit['telefone']}"
-
-                fornecedor_id = await conn.fetchval(
-                    """INSERT INTO fornecedores (nome, contato, ativo)
-                       VALUES ($1, $2, TRUE) RETURNING id""",
-                    nome_fornecedor[:200],
-                    contato_info[:200],
-                )
-                logger.info(
-                    "Fornecedor criado: %s (CNPJ: %s)",
-                    nome_fornecedor, cnpj,
-                )
+            fornecedor_id = await buscar_fornecedor_por_identificacao(
+                conn,
+                cnpj=cnpj,
+                nome=emit.get("razao_social") or emit.get("nome_fantasia"),
+                criar_se_ausente=True,
+                contato_extra=contato_extra,
+            )
 
             # ----------------------------------------------------------
             # 2. Tenta associar produtos a insumos existentes
@@ -335,28 +387,7 @@ async def salvar_nfe_xml(dados: Dict[str, Any], usuario_id: uuid.UUID) -> Dict[s
             for item in dados["produtos"]:
                 descricao = item.get("descricao", "")
                 ean = item.get("codigo_ean")
-                insumo_id = None
-
-                # Tenta por EAN (código de barras) — mais confiável
-                if ean and ean not in ("SEM GTIN", "0", "00000000000000"):
-                    insumo_id = await conn.fetchval(
-                        """SELECT id FROM insumos
-                           WHERE marcas_aceitaveis @> ARRAY[$1]::text[]
-                              OR apresentacao ILIKE $1
-                           LIMIT 1""",
-                        ean,
-                    )
-
-                # Tenta por descrição similar (trigram não disponível — usa ILIKE)
-                if not insumo_id and descricao:
-                    palavras = [p for p in descricao.split() if len(p) > 3][:3]
-                    for palavra in palavras:
-                        insumo_id = await conn.fetchval(
-                            "SELECT id FROM insumos WHERE nome ILIKE $1 AND ativo = TRUE LIMIT 1",
-                            f"%{palavra}%",
-                        )
-                        if insumo_id:
-                            break
+                insumo_id = await buscar_insumo_por_descricao(conn, descricao, ean=ean)
 
                 if insumo_id:
                     itens_associados.append({
