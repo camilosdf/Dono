@@ -378,6 +378,143 @@ async def importar_cotacao_documento(
         await release_ia_slot()
 
 
+# =====================================================================
+# Importação de Cotação — E-mail (.eml)
+# =====================================================================
+
+@router.post("/importar-cotacao/eml", status_code=202)
+async def importar_cotacao_eml(
+    arquivo: UploadFile = File(...),
+    fornecedor_id: Optional[str] = None,
+    current_user: dict = Depends(require_perfil("COMPRAS", "ADMIN")),
+):
+    """Importa cotações a partir de um arquivo de e-mail (.eml).
+
+    O usuário encaminha o e-mail do fornecedor para si mesmo, salva como
+    .eml e faz upload aqui. O endpoint extrai os anexos (.pdf, .xml, .xlsx)
+    e enfileira um job assíncrono para cada um, reutilizando o pipeline
+    de importação de documento já existente.
+
+    Anexos sem formato suportado são ignorados (listados em ignorados).
+    E-mails sem nenhum anexo suportado retornam 400.
+
+    fornecedor_id (opcional): repassado para todos os jobs enfileirados.
+
+    Processamento assíncrono — retorna lista de job_ids para polling em
+    GET /ia/importar-cotacao/jobs/{job_id}.
+    """
+    import email as _email_stdlib
+    import email.policy
+
+    await check_ia_rate_limit(current_user["user_id"])
+    await acquire_ia_slot()
+    try:
+        nome = arquivo.filename or ""
+        if not nome.lower().endswith(".eml"):
+            raise HTTPException(
+                status_code=400,
+                detail=error_detail("FORMATO_INVALIDO", "Apenas arquivos .eml são aceitos neste endpoint"),
+            )
+
+        conteudo_eml = await arquivo.read()
+        if len(conteudo_eml) > 10 * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail=error_detail("ARQUIVO_MUITO_GRANDE", "Arquivo .eml excede 10MB"),
+            )
+
+        fornecedor_uuid = None
+        if fornecedor_id:
+            try:
+                fornecedor_uuid = uuid.UUID(fornecedor_id)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=error_detail("VALIDACAO_INVALIDA", "fornecedor_id inválido"),
+                )
+
+        # Parsear o e-mail com a stdlib (sem dependência externa)
+        msg = _email_stdlib.message_from_bytes(
+            conteudo_eml,
+            policy=email.policy.default,
+        )
+
+        jobs_enfileirados = []
+        anexos_ignorados = []
+
+        for parte in msg.walk():
+            # Pular multipart containers e o corpo do e-mail
+            if parte.get_content_maintype() == "multipart":
+                continue
+            if parte.get_content_disposition() not in ("attachment", "inline"):
+                continue
+
+            nome_anexo = parte.get_filename() or ""
+            extensao = next(
+                (ext for ext in _EXTENSAO_PARA_FORMATO_COTACAO
+                 if nome_anexo.lower().endswith(ext)),
+                None,
+            )
+
+            if not extensao:
+                anexos_ignorados.append(nome_anexo or "(sem nome)")
+                continue
+
+            bytes_anexo = parte.get_payload(decode=True)
+            if not bytes_anexo:
+                anexos_ignorados.append(nome_anexo)
+                continue
+
+            formato = _EXTENSAO_PARA_FORMATO_COTACAO[extensao]
+            try:
+                job_id = await enfileirar_job_cotacao_documento(
+                    bytes_anexo,
+                    formato,
+                    uuid.UUID(current_user["user_id"]),
+                    fornecedor_uuid,
+                )
+                jobs_enfileirados.append({
+                    "job_id": str(job_id),
+                    "anexo": nome_anexo,
+                    "formato": formato,
+                    "status": "pendente",
+                })
+            except Exception as e:
+                logger.exception("Erro ao enfileirar anexo %s do .eml", nome_anexo)
+                anexos_ignorados.append(f"{nome_anexo} (erro: {e})")
+
+        if not jobs_enfileirados:
+            raise HTTPException(
+                status_code=400,
+                detail=error_detail(
+                    "SEM_ANEXOS_SUPORTADOS",
+                    f"Nenhum anexo suportado encontrado no .eml. "
+                    f"Ignorados: {anexos_ignorados or ['nenhum anexo encontrado']}",
+                ),
+            )
+
+        return {
+            "jobs": jobs_enfileirados,
+            "anexos_ignorados": anexos_ignorados,
+            "resumo": {
+                "total_anexos": len(jobs_enfileirados) + len(anexos_ignorados),
+                "enfileirados": len(jobs_enfileirados),
+                "ignorados": len(anexos_ignorados),
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Erro ao processar .eml")
+        raise HTTPException(
+            status_code=500,
+            detail=error_detail("ERRO_INTERNO", f"Erro ao processar .eml: {e}"),
+        )
+    finally:
+        await release_ia_slot()
+
+
 @router.get("/importar-cotacao/jobs/{job_id}")
 async def status_job_cotacao_documento(
     job_id: str,
