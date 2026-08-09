@@ -102,17 +102,14 @@ async def processar_proximo_job(db_pool: asyncpg.Pool) -> bool:
                 if not arquivo_bytes:
                     raise ValueError("Arquivo não encontrado no Redis (expirado ou não existe)")
 
-                formato = job["entrada"].get("formato")
-                fornecedor_hint = job["entrada"].get("fornecedor_id")
-                try:
-                    resultado = await processar_documento_cotacao(
-                        formato, arquivo_bytes, usuario_id,
-                        fornecedor_hint_id=uuid.UUID(fornecedor_hint) if fornecedor_hint else None,
-                    )
-                    resultado = {"status": "concluido", **resultado}
-                except ValueError as e:
-                    logger.warning("Falha na importação de cotação (job %s): %s", job_id, str(e))
-                    resultado = {"status": "erro", "erro_motivo": str(e)}
+                entrada = job["entrada"] if isinstance(job["entrada"], dict) else json.loads(job["entrada"])
+                formato = entrada.get("formato")
+                fornecedor_hint = entrada.get("fornecedor_id")
+                resultado = await processar_documento_cotacao(
+                    formato, arquivo_bytes, usuario_id,
+                    fornecedor_hint_id=uuid.UUID(fornecedor_hint) if fornecedor_hint else None,
+                )
+                resultado = {"status": "concluido", **resultado}
 
             elif tipo == "RAG_CONSULTA":
                 # (Futuro) Processamento de consulta RAG assíncrono

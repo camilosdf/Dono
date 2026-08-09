@@ -281,11 +281,13 @@ class TestRupturaEstoque:
         assert r.json()["lotes_vencendo"] == []
 
     async def test_ruptura_detecta_lote_vencendo(self, client, token_admin, conn):
+        # Data relativa — 3 dias à frente de CURRENT_DATE, dentro da janela de 7 dias
+        data_validade = await conn.fetchval("SELECT (CURRENT_DATE + 3)::text")
         ins_id = await _criar_insumo_com_lote(
             client, token_admin, conn,
             nome="Insumo Vencendo",
             qty=5.0,
-            data_validade="2026-08-07",  # amanhã
+            data_validade=data_validade,
         )
 
         r = await client.get("/relatorios/ruptura-estoque?dias=7",
