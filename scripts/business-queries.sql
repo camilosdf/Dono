@@ -1249,3 +1249,141 @@ BEGIN
     GROUP BY TO_CHAR(data_vencimento, 'YYYY-MM');
 END;
 $$ LANGUAGE plpgsql;
+
+
+-- =====================================================================
+-- fn_estimar_preco_insumo
+-- Estimativa estatística de preço com base no histórico de aquisição.
+--
+-- Fonte: lotes_insumo (compras reais registradas).
+-- Período: últimas p_janela_dias dias (padrão 90).
+-- Critério mínimo: pelo menos p_min_compras compras no período (padrão 2).
+--
+-- Ponderação combinada por recência e volume:
+--   w_rec_i = (janela - dias_desde_aquisicao) / SUM(janela - dias_j)
+--   w_vol_i = quantidade_i / SUM(quantidade_j)
+--   w_i     = SQRT(w_rec_i * w_vol_i)          -- média geométrica
+--   preco_estimado = SUM(w_i * valor_i) / SUM(w_i)
+--
+-- Retorna NULL em todos os campos quando histórico insuficiente.
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION fn_estimar_preco_insumo(
+    p_insumo_id      UUID,
+    p_janela_dias    INT  DEFAULT 90,
+    p_min_compras    INT  DEFAULT 2
+)
+RETURNS TABLE (
+    preco_estimado          NUMERIC(12,4),
+    preco_minimo            NUMERIC(12,4),
+    preco_maximo            NUMERIC(12,4),
+    num_compras             INT,
+    fornecedor_mais_barato_id UUID,
+    data_ultima_compra      DATE
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_num_compras INT;
+BEGIN
+    -- Conta compras elegíveis antes de calcular
+    SELECT COUNT(*)
+      INTO v_num_compras
+      FROM lotes_insumo l
+     WHERE l.insumo_id = p_insumo_id
+       AND l.data_aquisicao >= CURRENT_DATE - p_janela_dias;
+
+    -- Histórico insuficiente → retorna linha com todos NULLs
+    IF v_num_compras < p_min_compras THEN
+        RETURN QUERY SELECT
+            NULL::NUMERIC(12,4),
+            NULL::NUMERIC(12,4),
+            NULL::NUMERIC(12,4),
+            v_num_compras,
+            NULL::UUID,
+            NULL::DATE;
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    WITH compras AS (
+        -- Compras elegíveis com dias desde aquisição
+        SELECT
+            l.valor_aquisicao,
+            l.quantidade,
+            l.fornecedor_id,
+            l.data_aquisicao,
+            (CURRENT_DATE - l.data_aquisicao)::NUMERIC AS dias
+        FROM lotes_insumo l
+        WHERE l.insumo_id = p_insumo_id
+          AND l.data_aquisicao >= CURRENT_DATE - p_janela_dias
+    ),
+    totais AS (
+        -- Denominadores para normalização
+        SELECT
+            SUM(p_janela_dias - dias)  AS soma_rec,
+            SUM(quantidade)            AS soma_vol
+        FROM compras
+    ),
+    pesos AS (
+        -- Pesos individuais normalizados e combinados
+        SELECT
+            c.valor_aquisicao,
+            c.fornecedor_id,
+            c.data_aquisicao,
+            -- w_rec normalizado
+            CASE WHEN t.soma_rec > 0
+                 THEN (p_janela_dias - c.dias) / t.soma_rec
+                 ELSE 1.0 / (SELECT COUNT(*) FROM compras)
+            END AS w_rec,
+            -- w_vol normalizado
+            CASE WHEN t.soma_vol > 0
+                 THEN c.quantidade / t.soma_vol
+                 ELSE 1.0 / (SELECT COUNT(*) FROM compras)
+            END AS w_vol
+        FROM compras c
+        CROSS JOIN totais t
+    ),
+    pesos_combinados AS (
+        -- Peso combinado = raiz quadrada do produto (média geométrica)
+        SELECT
+            valor_aquisicao,
+            fornecedor_id,
+            data_aquisicao,
+            SQRT(w_rec * w_vol) AS w
+        FROM pesos
+    ),
+    resultado AS (
+        SELECT
+            -- Preço estimado: média ponderada pelo peso combinado (renormalizado)
+            ROUND(
+                SUM(w * valor_aquisicao) / NULLIF(SUM(w), 0),
+                4
+            )::NUMERIC(12,4)                           AS preco_estimado,
+            MIN(valor_aquisicao)::NUMERIC(12,4)        AS preco_minimo,
+            MAX(valor_aquisicao)::NUMERIC(12,4)        AS preco_maximo,
+            COUNT(*)::INT                               AS num_compras,
+            MAX(data_aquisicao)                        AS data_ultima_compra
+        FROM pesos_combinados
+    ),
+    fornecedor_barato AS (
+        -- Fornecedor com menor preço médio no período
+        SELECT fornecedor_id
+          FROM compras
+         WHERE fornecedor_id IS NOT NULL
+         GROUP BY fornecedor_id
+         ORDER BY AVG(valor_aquisicao)
+         LIMIT 1
+    )
+    SELECT
+        r.preco_estimado,
+        r.preco_minimo,
+        r.preco_maximo,
+        r.num_compras,
+        fb.fornecedor_id AS fornecedor_mais_barato_id,
+        r.data_ultima_compra
+    FROM resultado r
+    LEFT JOIN fornecedor_barato fb ON TRUE;
+END;
+$$;
