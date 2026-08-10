@@ -100,11 +100,130 @@ async def _sugerir_pratos_criativos(
 async def _buscar_precos_externos(
     insumo_ids: list[str], fornecedores_alvo: list[str] | None
 ) -> dict:
-    """Ponto de extensão para adapter de scraping/API de fornecedores."""
-    raise NotImplementedError(
-        "Nenhum adapter de cotação online configurado neste ambiente"
-    )
+    """Estima preços via histórico de aquisição (fn_estimar_preco_insumo)
+    e gera explicação em linguagem natural via Ollama local.
 
+    Princípio arquitetural: SQL/PL/pgSQL calcula, Ollama apenas explica.
+    Nunca inverte: o LLM não gera o número, apenas contextualiza o resultado
+    já produzido deterministicamente pelo domínio.
+
+    Retorna estrutura com estimativas por insumo + explicação textual.
+    Insumos sem histórico suficiente (<2 compras / 90 dias) são listados
+    em sem_historico sem gerar cotacao.
+    """
+    import json as _json
+    pool = get_pool()
+
+    estimativas = []
+    sem_historico = []
+
+    async with pool.acquire() as conn:
+        for insumo_id_str in insumo_ids:
+            try:
+                insumo_uuid = uuid.UUID(insumo_id_str)
+            except ValueError:
+                sem_historico.append({"insumo_id": insumo_id_str, "motivo": "UUID inválido"})
+                continue
+
+            # Buscar nome do insumo para contexto do LLM
+            insumo = await conn.fetchrow(
+                "SELECT id, nome, unidade FROM insumos WHERE id = $1 AND ativo = TRUE",
+                insumo_uuid,
+            )
+            if not insumo:
+                sem_historico.append({"insumo_id": insumo_id_str, "motivo": "Insumo não encontrado"})
+                continue
+
+            # Calcular estimativa via função SQL determinística
+            row = await conn.fetchrow(
+                "SELECT * FROM fn_estimar_preco_insumo($1)",
+                insumo_uuid,
+            )
+
+            if row["preco_estimado"] is None:
+                sem_historico.append({
+                    "insumo_id": insumo_id_str,
+                    "nome": insumo["nome"],
+                    "motivo": f"Histórico insuficiente ({row['num_compras']} compra(s) nos últimos 90 dias — mínimo: 2)",
+                })
+                continue
+
+            # Gravar cotação com origem IA_ONLINE, status PENDENTE_REVISAO
+            fornecedor_hint = None
+            if row["fornecedor_mais_barato_id"]:
+                fornecedor_hint = row["fornecedor_mais_barato_id"]
+
+            cotacao_id = await conn.fetchval(
+                """INSERT INTO cotacoes
+                       (insumo_id, fornecedor_id, preco_unitario, origem, status)
+                   VALUES ($1, $2, $3, 'IA_ONLINE', 'PENDENTE_REVISAO')
+                   RETURNING id""",
+                insumo_uuid,
+                fornecedor_hint,
+                row["preco_estimado"],
+            )
+
+            estimativas.append({
+                "cotacao_id": str(cotacao_id),
+                "insumo_id": insumo_id_str,
+                "nome": insumo["nome"],
+                "unidade": insumo["unidade"],
+                "preco_estimado": float(row["preco_estimado"]),
+                "preco_minimo": float(row["preco_minimo"]),
+                "preco_maximo": float(row["preco_maximo"]),
+                "num_compras": row["num_compras"],
+                "fornecedor_mais_barato_id": str(row["fornecedor_mais_barato_id"]) if row["fornecedor_mais_barato_id"] else None,
+                "data_ultima_compra": row["data_ultima_compra"].isoformat() if row["data_ultima_compra"] else None,
+            })
+
+    # Gerar explicação via Ollama (LLM explica, não calcula)
+    explicacao = None
+    if estimativas:
+        try:
+            contexto = _json.dumps(estimativas, ensure_ascii=False, indent=2)
+            prompt = f"""Você é um assistente de gestão de compras de um sistema de restaurante.
+Com base nas estimativas de preço calculadas pelo sistema a partir do histórico real de compras,
+gere uma explicação objetiva e útil para o gestor de compras, em português.
+
+Dados calculados pelo sistema:
+{contexto}
+
+Instruções:
+- Explique brevemente como cada preço foi estimado (média ponderada por recência e volume)
+- Destaque insumos com maior variação entre mínimo e máximo (possível instabilidade de preço)
+- Mencione o fornecedor mais barato quando disponível
+- Seja conciso (máximo 3 parágrafos)
+- NÃO invente preços ou datas — use apenas os dados fornecidos acima
+
+Explicação:"""
+
+            _timeout = float(os.getenv("OLLAMA_TIMEOUT", "120.0"))
+            async with httpx.AsyncClient(timeout=_timeout) as client:
+                resp = await client.post(
+                    f"{OLLAMA_HOST}/api/generate",
+                    json={
+                        "model": OLLAMA_MODEL,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"temperature": 0.2, "top_p": 0.9},
+                    },
+                )
+                resp.raise_for_status()
+                explicacao = resp.json().get("response", "").strip()
+        except Exception as e:
+            logger.warning("Ollama indisponível para explicação de cotação: %s", str(e))
+            explicacao = "Explicação indisponível (Ollama não respondeu)."
+
+    return {
+        "estimativas": estimativas,
+        "sem_historico": sem_historico,
+        "explicacao_ia": explicacao,
+        "resumo": {
+            "total_solicitados": len(insumo_ids),
+            "com_estimativa": len(estimativas),
+            "sem_historico": len(sem_historico),
+        },
+    }
 
 # =====================================================================
 # RAG — Consulta com recuperação de documentos
@@ -781,34 +900,45 @@ async def solicitar_cotacao_ia(
     nunca aplicado automaticamente ao custo sem aprovação humana.
     Sem adapter configurado, job termina em erro explícito.
     """
+    import json as _json
     await check_ia_rate_limit(current_user["user_id"])
     await acquire_ia_slot()
     try:
         pool = get_pool()
+
+        # Criar o job com conexão mínima — fecha antes do processamento pesado
         async with pool.acquire() as conn:
             job = await conn.fetchrow(
                 """INSERT INTO ia_jobs (tipo, solicitado_por, entrada)
                    VALUES ('COTACAO_ONLINE', $1, $2) RETURNING id""",
                 uuid.UUID(current_user["user_id"]),
-                {"insumo_ids": body.insumo_ids, "fornecedores_alvo": body.fornecedores_alvo},
+                _json.dumps({"insumo_ids": body.insumo_ids, "fornecedores_alvo": body.fornecedores_alvo}),
             )
-            try:
-                resultado = await _buscar_precos_externos(
-                    body.insumo_ids, body.fornecedores_alvo
-                )
-                import json as _json
+        job_id = job["id"]
+
+        # Processamento (pode abrir novas conexões internamente via get_pool)
+        try:
+            resultado = await _buscar_precos_externos(
+                body.insumo_ids, body.fornecedores_alvo
+            )
+            async with pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE ia_jobs SET status = 'concluido', resultado = $2, concluido_em = now() WHERE id = $1",
-                    job["id"],
+                    """UPDATE ia_jobs SET status = 'concluido', resultado = $2,
+                       concluido_em = now() WHERE id = $1""",
+                    job_id,
                     _json.dumps(resultado),
                 )
-            except NotImplementedError as e:
+        except Exception as e:
+            logger.exception("Erro ao processar cotacao_ia job %s", job_id)
+            async with pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE ia_jobs SET status = 'erro', erro_motivo = $2, concluido_em = now() WHERE id = $1",
-                    job["id"],
+                    """UPDATE ia_jobs SET status = 'erro', erro_motivo = $2,
+                       concluido_em = now() WHERE id = $1""",
+                    job_id,
                     str(e),
                 )
-            return {"job_id": str(job["id"])}
+
+        return {"job_id": str(job_id)}
     finally:
         await release_ia_slot()
 
