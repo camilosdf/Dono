@@ -5,18 +5,28 @@
 #   - OCR: processamento de notas fiscais (PDF/imagem) via ai_worker
 #   - NF-e XML: parser direto de XML de Nota Fiscal Eletrônica (síncrono)
 #   - Prospecção de pratos: match direto + sugestão criativa (stub LLM)
-#   - Cotação online: busca de preços via agente externo (stub)
+#   - Cotação online: estimativa estatística via fn_estimar_preco_insumo
+#     (SQL determinístico) + explicação em linguagem natural via Ollama
+#   - Importação de cotação: PDF/XML/XLSX/EML via pipeline assíncrono
 #
-# Atualização H1: integração NF-e XML (parsear_xml_nfe / salvar_nfe_xml)
-#   adicionada como rotas síncronas — sem job_id, sem polling, porque
-#   parsing de XML é instantâneo (diferente de OCR que exige inferência).
+# Princípio arquitetural (Opção B — aprovado):
+#   SQL/PL/pgSQL calcula os números; Ollama apenas explica o resultado.
+#   Nenhum número de preço é gerado pelo LLM.
+#
+# Histórico de patches:
+#   H1: integração NF-e XML (síncrono, sem polling)
+#   H2: importação de cotação por documento (PDF/XML/XLSX) + .eml
+#   H3: fn_estimar_preco_insumo + Fase 2 _buscar_precos_externos
+#   H4: correções status_job_cotacao (json.loads + autenticação) e
+#       _buscar_precos_externos (import os local para OLLAMA_TIMEOUT)
 
+import os
 import uuid
 import logging
-from datetime import date, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile
 from pydantic import BaseModel
 
 from app.database import get_pool
@@ -34,6 +44,10 @@ from app.rate_limit import acquire_ia_slot, check_ia_rate_limit, release_ia_slot
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ia")
+
+# Configuração do Ollama (lida do ambiente uma única vez no import)
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
 
 # =====================================================================
@@ -76,6 +90,7 @@ class CotacaoOnlineRequest(BaseModel):
 # =====================================================================
 
 async def _insumos_criticos(conn, dias: int) -> list[dict]:
+    """Retorna insumos com lotes vencendo nos próximos N dias."""
     rows = await conn.fetch(
         """SELECT DISTINCT i.id AS insumo_id, i.nome
              FROM insumos i JOIN lotes_insumo l ON l.insumo_id = i.id
@@ -103,13 +118,26 @@ async def _buscar_precos_externos(
     """Estima preços via histórico de aquisição (fn_estimar_preco_insumo)
     e gera explicação em linguagem natural via Ollama local.
 
-    Princípio arquitetural: SQL/PL/pgSQL calcula, Ollama apenas explica.
-    Nunca inverte: o LLM não gera o número, apenas contextualiza o resultado
-    já produzido deterministicamente pelo domínio.
+    Princípio arquitetural (Opção B — aprovado em H3):
+      SQL/PL/pgSQL calcula (fn_estimar_preco_insumo); Ollama apenas explica.
+      O LLM nunca gera números — apenas contextualiza o resultado determinístico.
 
-    Retorna estrutura com estimativas por insumo + explicação textual.
-    Insumos sem histórico suficiente (<2 compras / 90 dias) são listados
-    em sem_historico sem gerar cotacao.
+    Fórmula de estimativa (implementada em fn_estimar_preco_insumo):
+      w_rec_i = (janela - dias_desde_aquisicao) / SUM(janela - dias_j)
+      w_vol_i = quantidade_i / SUM(quantidade_j)
+      w_i     = SQRT(w_rec_i * w_vol_i)   -- média geométrica
+      preco_estimado = SUM(w_i * valor_i) / SUM(w_i)
+
+    Insumos sem histórico suficiente (<2 compras nos últimos 90 dias)
+    são listados em sem_historico sem gerar cotacao.
+
+    Args:
+        insumo_ids: Lista de UUIDs dos insumos a estimar.
+        fornecedores_alvo: Ignorado nesta implementação (reservado para
+            futura filtragem por fornecedor preferencial).
+
+    Returns:
+        dict com estimativas, sem_historico, explicacao_ia e resumo.
     """
     import json as _json
     pool = get_pool()
@@ -119,40 +147,50 @@ async def _buscar_precos_externos(
 
     async with pool.acquire() as conn:
         for insumo_id_str in insumo_ids:
+            # Validar UUID antes de qualquer consulta
             try:
                 insumo_uuid = uuid.UUID(insumo_id_str)
             except ValueError:
-                sem_historico.append({"insumo_id": insumo_id_str, "motivo": "UUID inválido"})
+                sem_historico.append({
+                    "insumo_id": insumo_id_str,
+                    "motivo": "UUID inválido",
+                })
                 continue
 
-            # Buscar nome do insumo para contexto do LLM
+            # Verificar se o insumo existe e está ativo
             insumo = await conn.fetchrow(
                 "SELECT id, nome, unidade FROM insumos WHERE id = $1 AND ativo = TRUE",
                 insumo_uuid,
             )
             if not insumo:
-                sem_historico.append({"insumo_id": insumo_id_str, "motivo": "Insumo não encontrado"})
+                sem_historico.append({
+                    "insumo_id": insumo_id_str,
+                    "motivo": "Insumo não encontrado",
+                })
                 continue
 
-            # Calcular estimativa via função SQL determinística
+            # Chamar a função SQL determinística de estimativa
+            # (mínimo 2 compras nos últimos 90 dias — parâmetros padrão)
             row = await conn.fetchrow(
                 "SELECT * FROM fn_estimar_preco_insumo($1)",
                 insumo_uuid,
             )
 
             if row["preco_estimado"] is None:
+                # Histórico insuficiente — não gera cotacao
                 sem_historico.append({
                     "insumo_id": insumo_id_str,
                     "nome": insumo["nome"],
-                    "motivo": f"Histórico insuficiente ({row['num_compras']} compra(s) nos últimos 90 dias — mínimo: 2)",
+                    "motivo": (
+                        f"Histórico insuficiente ({row['num_compras']} compra(s) "
+                        f"nos últimos 90 dias — mínimo: 2)"
+                    ),
                 })
                 continue
 
-            # Gravar cotação com origem IA_ONLINE, status PENDENTE_REVISAO
-            fornecedor_hint = None
-            if row["fornecedor_mais_barato_id"]:
-                fornecedor_hint = row["fornecedor_mais_barato_id"]
-
+            # Gravar cotação pendente de revisão humana
+            # origem=IA_ONLINE distingue de cotações manuais e importadas
+            fornecedor_hint = row["fornecedor_mais_barato_id"] or None
             cotacao_id = await conn.fetchval(
                 """INSERT INTO cotacoes
                        (insumo_id, fornecedor_id, preco_unitario, origem, status)
@@ -172,11 +210,18 @@ async def _buscar_precos_externos(
                 "preco_minimo": float(row["preco_minimo"]),
                 "preco_maximo": float(row["preco_maximo"]),
                 "num_compras": row["num_compras"],
-                "fornecedor_mais_barato_id": str(row["fornecedor_mais_barato_id"]) if row["fornecedor_mais_barato_id"] else None,
-                "data_ultima_compra": row["data_ultima_compra"].isoformat() if row["data_ultima_compra"] else None,
+                "fornecedor_mais_barato_id": (
+                    str(row["fornecedor_mais_barato_id"])
+                    if row["fornecedor_mais_barato_id"] else None
+                ),
+                "data_ultima_compra": (
+                    row["data_ultima_compra"].isoformat()
+                    if row["data_ultima_compra"] else None
+                ),
             })
 
-    # Gerar explicação via Ollama (LLM explica, não calcula)
+    # Gerar explicação via Ollama apenas quando houver estimativas
+    # (sem estimativas, não há contexto para o LLM explicar)
     explicacao = None
     if estimativas:
         try:
@@ -197,7 +242,11 @@ Instruções:
 
 Explicação:"""
 
-            _timeout = float(os.getenv("OLLAMA_TIMEOUT", "120.0"))
+            # PATCH H4: import local explícito para garantir que os.getenv
+            # seja resolvido no escopo correto (evita NameError em testes)
+            import os as _os
+            _timeout = float(_os.getenv("OLLAMA_TIMEOUT", "120.0"))
+
             async with httpx.AsyncClient(timeout=_timeout) as client:
                 resp = await client.post(
                     f"{OLLAMA_HOST}/api/generate",
@@ -210,7 +259,10 @@ Explicação:"""
                 )
                 resp.raise_for_status()
                 explicacao = resp.json().get("response", "").strip()
+
         except Exception as e:
+            # Fallback gracioso: Ollama indisponível não impede o retorno
+            # das estimativas calculadas pelo SQL
             logger.warning("Ollama indisponível para explicação de cotação: %s", str(e))
             explicacao = "Explicação indisponível (Ollama não respondeu)."
 
@@ -224,6 +276,7 @@ Explicação:"""
             "sem_historico": len(sem_historico),
         },
     }
+
 
 # =====================================================================
 # RAG — Consulta com recuperação de documentos
@@ -263,7 +316,6 @@ async def consultar_rag(
             fontes=[],
         )
 
-    import os
     MAX_DOC_CHARS = int(os.getenv("RAG_MAX_DOC_CHARS", "2500"))
     MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "8000"))
 
@@ -409,6 +461,7 @@ async def status_job_ocr(
 # Importação de Cotação — Documentos (PDF/XML/XLSX)
 # =====================================================================
 
+# Mapeamento extensão → formato para reutilização nos dois endpoints de cotação
 _EXTENSAO_PARA_FORMATO_COTACAO = {".pdf": "pdf", ".xml": "xml", ".xlsx": "xlsx"}
 
 
@@ -886,7 +939,7 @@ async def status_job_prospeccao(job_id: str):
 
 
 # =====================================================================
-# Cotação Online via IA
+# Cotação Online via IA (Opção B — estimativa estatística)
 # =====================================================================
 
 @router.post("/cotacoes/ia-online", status_code=202)
@@ -894,11 +947,17 @@ async def solicitar_cotacao_ia(
     body: CotacaoOnlineRequest,
     current_user: dict = Depends(require_perfil("COMPRAS", "ADMIN")),
 ):
-    """Dispara busca de preços online via agente de IA.
+    """Solicita estimativa de preços via histórico de aquisição + Ollama.
+
+    Para cada insumo_id informado:
+      1. Chama fn_estimar_preco_insumo (SQL determinístico).
+      2. Grava cotacao (origem=IA_ONLINE, status=PENDENTE_REVISAO) se
+         houver histórico suficiente (>=2 compras nos últimos 90 dias).
+      3. Insumos sem histórico listados em sem_historico.
+      4. Ollama gera explicação textual do conjunto de estimativas.
 
     Resultado entra como Cotacao com status=PENDENTE_REVISAO —
     nunca aplicado automaticamente ao custo sem aprovação humana.
-    Sem adapter configurado, job termina em erro explícito.
     """
     import json as _json
     await check_ia_rate_limit(current_user["user_id"])
@@ -907,16 +966,20 @@ async def solicitar_cotacao_ia(
         pool = get_pool()
 
         # Criar o job com conexão mínima — fecha antes do processamento pesado
+        # (chamada ao Ollama pode durar 30-120s; não deve reter conexão do pool)
         async with pool.acquire() as conn:
             job = await conn.fetchrow(
                 """INSERT INTO ia_jobs (tipo, solicitado_por, entrada)
                    VALUES ('COTACAO_ONLINE', $1, $2) RETURNING id""",
                 uuid.UUID(current_user["user_id"]),
-                _json.dumps({"insumo_ids": body.insumo_ids, "fornecedores_alvo": body.fornecedores_alvo}),
+                _json.dumps({
+                    "insumo_ids": body.insumo_ids,
+                    "fornecedores_alvo": body.fornecedores_alvo,
+                }),
             )
         job_id = job["id"]
 
-        # Processamento (pode abrir novas conexões internamente via get_pool)
+        # Processamento: abre novas conexões internamente via get_pool()
         try:
             resultado = await _buscar_precos_externos(
                 body.insumo_ids, body.fornecedores_alvo
@@ -944,8 +1007,16 @@ async def solicitar_cotacao_ia(
 
 
 @router.get("/cotacoes/ia-online/jobs/{job_id}", response_model=JobOut)
-async def status_job_cotacao(job_id: str):
-    """Consulta status de um job de cotação online."""
+async def status_job_cotacao(
+    job_id: str,
+    current_user: dict = Depends(require_perfil("COMPRAS", "ADMIN")),
+):
+    """Consulta status de um job de cotação online.
+
+    PATCH H4: adicionado require_perfil (antes o endpoint era público,
+    retornando 404 para não autenticados em vez de 401).
+    """
+    import json as _json
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -957,9 +1028,20 @@ async def status_job_cotacao(job_id: str):
                 status_code=404,
                 detail=error_detail("RECURSO_NAO_ENCONTRADO", "Job não encontrado"),
             )
+
+        # PATCH H4: resultado vem do banco como string JSON (asyncpg não
+        # deserializa JSONB automaticamente em todos os contextos); fazer
+        # json.loads() antes de passar para JobOut evita ValidationError.
+        resultado = row["resultado"]
+        if isinstance(resultado, str):
+            try:
+                resultado = _json.loads(resultado)
+            except Exception:
+                pass  # manter como string se não for JSON válido
+
         return JobOut(
             job_id=str(row["id"]),
             status=row["status"],
-            resultado=row["resultado"],
+            resultado=resultado,
             erro_motivo=row["erro_motivo"],
         )
